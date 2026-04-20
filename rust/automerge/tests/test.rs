@@ -2689,3 +2689,15 @@ fn sync_one_message(
         from.sync().receive_sync_message(from_sync, msg).unwrap();
     }
 }
+
+#[test]
+fn import_obj_with_bad_hex_returns_err_not_panic() {
+    // Regression: import_obj() called hex::decode().unwrap() on the actor
+    // suffix, so any non-hex string after `@` crashed the process.
+    let doc = new_doc();
+    let err = doc.import_obj("1@notvalidhex").unwrap_err();
+    assert!(matches!(
+        err,
+        automerge::AutomergeError::InvalidObjIdFormat(_)
+    ));
+}
