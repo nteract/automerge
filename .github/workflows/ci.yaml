@@ -1,11 +1,14 @@
 name: CI
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
+      - desktop-patches
   pull_request:
     branches:
       - main
+      - desktop-patches
 jobs:
   fmt:
     runs-on: ubuntu-latest
