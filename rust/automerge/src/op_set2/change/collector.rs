@@ -1020,6 +1020,12 @@ pub(crate) struct ChangeCols {
     pub(crate) data: Vec<u8>,
 }
 
+#[cfg(all(feature = "wasm", target_family = "wasm"))]
+const CAN_OOM: bool = true;
+
+#[cfg(not(all(feature = "wasm", target_family = "wasm")))]
+const CAN_OOM: bool = false;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1182,9 +1188,3 @@ mod tests {
         assert!(matches!(err, Error::IncorrectMaxOp));
     }
 }
-
-#[cfg(all(feature = "wasm", target_family = "wasm"))]
-const CAN_OOM: bool = true;
-
-#[cfg(not(all(feature = "wasm", target_family = "wasm")))]
-const CAN_OOM: bool = false;
