@@ -1313,8 +1313,8 @@ impl OpRange {
 #[cfg(test)]
 mod tests {
     use crate::{
-        sync::SyncDoc, transaction::Transactable, ActorId, AutoCommit, ReadDoc, ScalarValue, Value,
-        ROOT,
+        patches::PatchLog, sync::SyncDoc, transaction::Transactable, ActorId, AutoCommit,
+        AutomergeError, ReadDoc, ScalarValue, Value, ROOT,
     };
 
     fn is_send<S: Send>() {}
@@ -1359,5 +1359,44 @@ mod tests {
             }
             other => panic!("expected synced scalar value, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sync_receive_with_active_mismatched_patch_log_returns_error() {
+        let mut receiver = AutoCommit::new();
+        receiver.set_actor(ActorId::from(b"receiver" as &[u8]));
+        receiver.put(ROOT, "local", "value").unwrap();
+        receiver.patch_log = PatchLog::active();
+        receiver.patch_log.actors = vec![ActorId::from(b"aaa-stale-actor" as &[u8])];
+
+        let mut donor = AutoCommit::new();
+        donor.set_actor(ActorId::from(b"donor" as &[u8]));
+        donor.put(ROOT, "key", "value").unwrap();
+
+        let mut receiver_sync = crate::sync::State::new();
+        let mut donor_sync = crate::sync::State::new();
+
+        if let Some(handshake) = receiver.sync().generate_sync_message(&mut receiver_sync) {
+            donor
+                .sync()
+                .receive_sync_message(&mut donor_sync, handshake)
+                .unwrap();
+        }
+
+        let message = donor
+            .sync()
+            .generate_sync_message(&mut donor_sync)
+            .expect("donor should advertise its change");
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            receiver
+                .sync()
+                .receive_sync_message(&mut receiver_sync, message)
+        }));
+
+        assert!(
+            matches!(result, Ok(Err(AutomergeError::PatchLogMismatch))),
+            "expected PatchLogMismatch without panic, got {result:?}"
+        );
     }
 }
