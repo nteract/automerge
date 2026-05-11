@@ -917,48 +917,54 @@ impl BatchApply {
         let mut edges_by_obj: SmallHashMap<ObjId, SmallHashMap<ElemId, Vec<ElemId>>> =
             HashMap::default();
         let mut inserts_by_obj: SmallHashMap<ObjId, Vec<(ElemId, ElemId)>> = HashMap::default();
+        let mut references_by_obj: SmallHashMap<ObjId, Vec<ElemId>> = HashMap::default();
 
         for ops in imported {
             for op in ops {
-                if !op.insert() {
-                    continue;
-                }
                 if let KeyRef::Seq(key) = op.key() {
                     let key = *key;
-                    let id = ElemId(op.id());
-                    edges_by_obj
-                        .entry(op.bld.obj)
-                        .or_default()
-                        .entry(key)
-                        .or_default()
-                        .push(id);
-                    inserts_by_obj
-                        .entry(op.bld.obj)
-                        .or_default()
-                        .push((id, key));
+                    if op.insert() {
+                        let id = ElemId(op.id());
+                        edges_by_obj
+                            .entry(op.bld.obj)
+                            .or_default()
+                            .entry(key)
+                            .or_default()
+                            .push(id);
+                        inserts_by_obj
+                            .entry(op.bld.obj)
+                            .or_default()
+                            .push((id, key));
+                    } else {
+                        references_by_obj.entry(op.bld.obj).or_default().push(key);
+                    }
                 }
             }
         }
 
-        for (obj, inserts) in inserts_by_obj {
+        let mut sequence_objs: HashSet<ObjId> = inserts_by_obj.keys().copied().collect();
+        sequence_objs.extend(references_by_obj.keys().copied());
+
+        for obj in sequence_objs {
             let mut reachable = HashSet::new();
             let mut queue = VecDeque::from([ElemId::head()]);
 
+            let mut existing_candidates = HashSet::new();
             if let Some(edges) = edges_by_obj.get(&obj) {
-                for key in edges.keys() {
-                    if key.is_head() {
-                        continue;
-                    }
-                    if let (Some(doc_key), Some(doc_obj)) = (
-                        Self::elem_id_in_current_doc(*key, actors, doc),
-                        Self::obj_id_in_current_doc(obj, actors, doc),
-                    ) {
-                        if let Some((op, _)) =
-                            doc.ops().find_op_by_id_and_vis_slow(&doc_key.0, None)
-                        {
-                            if op.obj == doc_obj && op.insert {
-                                queue.push_back(*key);
-                            }
+                existing_candidates.extend(edges.keys().copied().filter(|key| !key.is_head()));
+            }
+            if let Some(references) = references_by_obj.get(&obj) {
+                existing_candidates.extend(references.iter().copied().filter(|key| !key.is_head()));
+            }
+
+            for key in existing_candidates {
+                if let (Some(doc_key), Some(doc_obj)) = (
+                    Self::elem_id_in_current_doc(key, actors, doc),
+                    Self::obj_id_in_current_doc(obj, actors, doc),
+                ) {
+                    if let Some((op, _)) = doc.ops().find_op_by_id_and_vis_slow(&doc_key.0, None) {
+                        if op.obj == doc_obj && op.insert {
+                            queue.push_back(key);
                         }
                     }
                 }
@@ -974,11 +980,23 @@ impl BatchApply {
                 }
             }
 
-            for (id, key) in inserts {
-                if !reachable.contains(&id) {
-                    return Err(AutomergeError::InvalidSeqKey(Self::format_elem_id(
-                        key, actors,
-                    )));
+            if let Some(inserts) = inserts_by_obj.remove(&obj) {
+                for (id, key) in inserts {
+                    if !reachable.contains(&id) {
+                        return Err(AutomergeError::InvalidSeqKey(Self::format_elem_id(
+                            key, actors,
+                        )));
+                    }
+                }
+            }
+
+            if let Some(references) = references_by_obj.remove(&obj) {
+                for key in references {
+                    if !reachable.contains(&key) || key.is_head() {
+                        return Err(AutomergeError::InvalidSeqKey(Self::format_elem_id(
+                            key, actors,
+                        )));
+                    }
                 }
             }
         }
