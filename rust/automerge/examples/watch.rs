@@ -5,7 +5,7 @@ use automerge::AutomergeError;
 use automerge::ROOT;
 use automerge::{Patch, PatchAction, PatchLog};
 
-fn main() {
+fn main() -> Result<(), AutomergeError> {
     let mut doc = Automerge::new();
 
     // a simple scalar change in the root object
@@ -13,31 +13,29 @@ fn main() {
         .transact_and_log_patches_with::<_, _, AutomergeError, _>(
             |_result| CommitOptions::default(),
             |tx| {
-                tx.put(ROOT, "hello", "world").unwrap();
+                tx.put(ROOT, "hello", "world")?;
                 Ok(())
             },
         )
-        .unwrap();
+        .map_err(|failure| failure.error)?;
     get_changes(&doc, doc.make_patches(&mut result.patch_log));
 
-    let mut tx = doc.transaction_log_patches(PatchLog::active());
-    let map = tx
-        .put_object(ROOT, "my new map", automerge::ObjType::Map)
-        .unwrap();
-    tx.put(&map, "blah", 1).unwrap();
-    tx.put(&map, "blah2", 1).unwrap();
-    let list = tx
-        .put_object(&map, "my list", automerge::ObjType::List)
-        .unwrap();
-    tx.insert(&list, 0, "yay").unwrap();
-    let m = tx.insert_object(&list, 0, automerge::ObjType::Map).unwrap();
-    tx.put(&m, "hi", 2).unwrap();
-    tx.insert(&list, 1, "woo").unwrap();
-    let m = tx.insert_object(&list, 2, automerge::ObjType::Map).unwrap();
-    tx.put(&m, "hi", 2).unwrap();
+    let mut tx = doc.transaction_log_patches(PatchLog::active())?;
+    let map = tx.put_object(ROOT, "my new map", automerge::ObjType::Map)?;
+    tx.put(&map, "blah", 1)?;
+    tx.put(&map, "blah2", 1)?;
+    let list = tx.put_object(&map, "my list", automerge::ObjType::List)?;
+    tx.insert(&list, 0, "yay")?;
+    let m = tx.insert_object(&list, 0, automerge::ObjType::Map)?;
+    tx.put(&m, "hi", 2)?;
+    tx.insert(&list, 1, "woo")?;
+    let m = tx.insert_object(&list, 2, automerge::ObjType::Map)?;
+    tx.put(&m, "hi", 2)?;
     let (_heads3, mut patch_log) = tx.commit_with(CommitOptions::default());
     let patches = doc.make_patches(&mut patch_log);
     get_changes(&doc, patches);
+
+    Ok(())
 }
 
 fn get_changes(_doc: &Automerge, patches: Vec<Patch>) {

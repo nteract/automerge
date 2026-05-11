@@ -1717,7 +1717,7 @@ fn can_transaction_at() -> Result<(), AutomergeError> {
     assert_eq!(tx.get(&ROOT, "size").unwrap().unwrap().0, Value::int(200));
     tx.commit();
 
-    let mut tx = doc1.transaction_at(PatchLog::null(), &heads1);
+    let mut tx = doc1.transaction_at(PatchLog::null(), &heads1)?;
     assert_eq!(tx.text(&txt).unwrap(), "aaabbbccc");
     assert_eq!(tx.get(&ROOT, "size").unwrap().unwrap().0, Value::int(100));
     tx.splice_text(&txt, 3, 3, "ZZZ")?;
@@ -1728,7 +1728,7 @@ fn can_transaction_at() -> Result<(), AutomergeError> {
     assert_eq!(doc1.text(&txt).unwrap(), "aaaZZZQQQccc");
     assert_eq!(doc1.get(&ROOT, "size").unwrap().unwrap().0, Value::int(300));
 
-    let mut tx = doc1.transaction_at(PatchLog::null(), &heads1);
+    let mut tx = doc1.transaction_at(PatchLog::null(), &heads1)?;
     assert_eq!(tx.text(&txt).unwrap(), "aaabbbccc");
     assert_eq!(tx.get(&ROOT, "size").unwrap().unwrap().0, Value::int(100));
     tx.splice_text(&txt, 3, 3, "TTT")?;
@@ -1739,6 +1739,70 @@ fn can_transaction_at() -> Result<(), AutomergeError> {
     assert_eq!(doc1.text(&txt).unwrap(), "aaaTTTZZZQQQccc");
     assert_eq!(doc1.get(&ROOT, "size").unwrap().unwrap().0, Value::int(400));
     Ok(())
+}
+
+fn active_patch_log_for_actor(actor: &[u8]) -> PatchLog {
+    let mut doc = Automerge::new();
+    doc.set_actor(ActorId::from(actor));
+    let mut tx = doc.transaction_log_patches(PatchLog::active()).unwrap();
+    tx.put(ROOT, "key", "value").unwrap();
+    let (_, patch_log) = tx.commit();
+    patch_log
+}
+
+fn document_with_actor(actor: &[u8]) -> Automerge {
+    let mut doc = Automerge::new();
+    doc.set_actor(ActorId::from(actor));
+    let mut tx = doc.transaction();
+    tx.put(ROOT, "key", "value").unwrap();
+    tx.commit();
+    doc
+}
+
+#[test]
+fn transaction_log_patches_with_mismatched_active_patch_log_returns_error() {
+    let patch_log = active_patch_log_for_actor(b"aaa-source");
+    let mut doc = document_with_actor(b"zzz-target");
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        doc.transaction_log_patches(patch_log)
+    }));
+
+    assert!(
+        matches!(result, Ok(Err(AutomergeError::PatchLogMismatch))),
+        "expected PatchLogMismatch without panic, got {result:?}"
+    );
+}
+
+#[test]
+fn transaction_at_with_mismatched_active_patch_log_returns_error() {
+    let patch_log = active_patch_log_for_actor(b"aaa-source");
+    let mut doc = document_with_actor(b"zzz-target");
+    let heads = doc.get_heads();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        doc.transaction_at(patch_log, &heads)
+    }));
+
+    assert!(
+        matches!(result, Ok(Err(AutomergeError::PatchLogMismatch))),
+        "expected PatchLogMismatch without panic, got {result:?}"
+    );
+}
+
+#[test]
+fn into_transaction_with_mismatched_active_patch_log_returns_error() {
+    let patch_log = active_patch_log_for_actor(b"aaa-source");
+    let doc = document_with_actor(b"zzz-target");
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        doc.into_transaction(Some(patch_log), None)
+    }));
+
+    assert!(
+        matches!(result, Ok(Err(AutomergeError::PatchLogMismatch))),
+        "expected PatchLogMismatch without panic, got {result:?}"
+    );
 }
 
 #[test]

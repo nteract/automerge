@@ -31,8 +31,24 @@ impl<'a> Transaction<'a> {
         doc: &'a mut Automerge,
         args: TransactionArgs,
         mut patch_log: PatchLog,
+    ) -> Result<Self, AutomergeError> {
+        patch_log.migrate_actors(&doc.ops().actors)?;
+        Ok(Self::from_migrated_patch_log(doc, args, patch_log))
+    }
+
+    pub(crate) fn new_fresh(doc: &'a mut Automerge, args: TransactionArgs, active: bool) -> Self {
+        let mut patch_log = PatchLog::new(active);
+        // Fresh patch logs have no actor-indexed data to reindex, so initialize
+        // them directly to the document actor table instead of migrating.
+        patch_log.actors = doc.ops().actors.clone();
+        Self::from_migrated_patch_log(doc, args, patch_log)
+    }
+
+    fn from_migrated_patch_log(
+        doc: &'a mut Automerge,
+        args: TransactionArgs,
+        patch_log: PatchLog,
     ) -> Self {
-        patch_log.migrate_actors(&doc.ops().actors).unwrap(); // we forked and merged so there will be no mismatch
         Self {
             inner: Some(TransactionInner::new(args)),
             doc,

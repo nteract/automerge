@@ -368,11 +368,14 @@ impl Automerge {
     /// Start a transaction.
     pub fn transaction(&mut self) -> Transaction<'_> {
         let args = self.transaction_args(None);
-        Transaction::new(self, args, PatchLog::inactive())
+        Transaction::new_fresh(self, args, false)
     }
 
     /// Start a transaction which records changes in a [`PatchLog`]
-    pub fn transaction_log_patches(&mut self, patch_log: PatchLog) -> Transaction<'_> {
+    pub fn transaction_log_patches(
+        &mut self,
+        patch_log: PatchLog,
+    ) -> Result<Transaction<'_>, AutomergeError> {
         let args = self.transaction_args(None);
         Transaction::new(self, args, patch_log)
     }
@@ -381,7 +384,11 @@ impl Automerge {
     ///
     /// If `heads` do not include the current actor's latest change, Automerge will use an internal
     /// concurrent actor for new changes so the current actor's sequence remains linear.
-    pub fn transaction_at(&mut self, patch_log: PatchLog, heads: &[ChangeHash]) -> Transaction<'_> {
+    pub fn transaction_at(
+        &mut self,
+        patch_log: PatchLog,
+        heads: &[ChangeHash],
+    ) -> Result<Transaction<'_>, AutomergeError> {
         let args = self.transaction_args(Some(heads));
         Transaction::new(self, args, patch_log)
     }
@@ -401,7 +408,7 @@ impl Automerge {
         self,
         patch_log: Option<PatchLog>,
         heads: Option<&[ChangeHash]>,
-    ) -> OwnedTransaction {
+    ) -> Result<OwnedTransaction, AutomergeError> {
         OwnedTransaction::new(self, patch_log, heads)
     }
 
@@ -525,7 +532,8 @@ impl Automerge {
         F: FnOnce(&mut Transaction<'_>) -> Result<O, E>,
         C: FnOnce(&O) -> CommitOptions,
     {
-        let mut tx = self.transaction_log_patches(PatchLog::active());
+        let args = self.transaction_args(None);
+        let mut tx = Transaction::new_fresh(self, args, true);
         let result = f(&mut tx);
         match result {
             Ok(result) => {
