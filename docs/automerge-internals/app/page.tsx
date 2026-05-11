@@ -3,6 +3,7 @@ import {
   ArrowRight,
   Binary,
   Braces,
+  Cpu,
   FileWarning,
   GitBranch,
   Route,
@@ -10,7 +11,7 @@ import {
 } from "lucide-react";
 import { docs, patchTimeline } from "../content/registry";
 
-const icons = [Braces, GitBranch, Binary, ShieldAlert, FileWarning, Route];
+const icons = [Braces, GitBranch, Cpu, Binary, ShieldAlert, FileWarning, Route];
 
 export default function HomePage() {
   return (

@@ -1,0 +1,128 @@
+import { Callout } from "../components/Callout";
+import { SourceCard } from "../components/SourceCard";
+import { Quiz } from "../components/Quiz";
+import {
+  BloomFilterExplainer,
+  ChangeGraphExplainer,
+  SequenceReachabilityExplainer,
+} from "../components/DataStructureExplainers";
+
+## Why data structures matter here
+
+The panic reductions are easier to understand once the core structures are not
+abstract names. Automerge keeps compact indexes around causal history, visible
+objects, sequence positions, and sync summaries. Many bugs in `desktop-patches`
+were failures to reject impossible structure before later code trusted an index.
+
+<Callout title="The recurring algorithmic move" tone="proof">
+Validate the graph or index before mutating the document. If a reference cannot
+be resolved in the preflight model, return an error before actor tables, op
+sets, histories, or patch logs move forward.
+</Callout>
+
+## Bloom filters in sync
+
+Bloom filters are compact set summaries. Automerge uses them in sync `Have`
+messages to summarize changes the sender has added since the last shared
+frontier. They can say "definitely not present" or "maybe present"; they cannot
+prove membership.
+
+<SourceCard path="rust/automerge/src/sync/bloom.rs">
+The production constants target a low false-positive rate: 10 bits per entry
+and 7 probes. The explainer below uses smaller defaults so collisions are easy
+to see.
+</SourceCard>
+
+<BloomFilterExplainer />
+
+## Change graph closure
+
+The change graph stores causal dependencies. A head is not just one change; it
+is shorthand for that change plus every dependency reachable behind it. That is
+why desktop snapshot completion can ask whether advertised heads are locally
+present: if the local history has those heads, it also has their accepted
+dependencies.
+
+<SourceCard path="rust/automerge/src/change_graph.rs">
+Read the `ChangeGraph` fields as a compact adjacency-list design: hashes,
+parents, heads, actor sequence indexes, and caches for clock queries.
+</SourceCard>
+
+<ChangeGraphExplainer />
+
+## Sequence reachability
+
+Lists and text are not validated with numeric indexes alone. Operations point
+at element ids. The `desktop-patches` sequence-key reductions reject incoming
+list operations when the referenced element cannot be reached from `HEAD`, the
+current document, or earlier inserts in the same incoming batch.
+
+<SourceCard path="rust/automerge/src/op_set2/change/batch.rs">
+`validate_imported_sequence_keys` builds a small graph of inserted elements and
+references, walks from `HEAD`, and rejects missing insert/update/delete targets
+before mutating history.
+</SourceCard>
+
+<SequenceReachabilityExplainer />
+
+## Other structures to learn next
+
+<table>
+  <thead>
+    <tr>
+      <th>Structure</th>
+      <th>What it buys</th>
+      <th>Read next</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Actor table</td>
+      <td>Compact integer indexes for actor ids inside ops and changes.</td>
+      <td><code>types.rs</code>, <code>op_set2/change/batch.rs</code></td>
+    </tr>
+    <tr>
+      <td>Op set</td>
+      <td>Queryable object state derived from imported operations.</td>
+      <td><code>op_set2/op_set.rs</code></td>
+    </tr>
+    <tr>
+      <td>Patch log</td>
+      <td>Relative view deltas for callers that keep materialized UI state.</td>
+      <td><code>patches/patch_log.rs</code></td>
+    </tr>
+    <tr>
+      <td>Columnar storage</td>
+      <td>Compact save/load representation for changes, ops, metadata, and extras.</td>
+      <td><code>storage/document.rs</code>, <code>storage/columns.rs</code></td>
+    </tr>
+  </tbody>
+</table>
+
+## Knowledge check
+
+<Quiz
+  title="Data structures check"
+  questions={[
+    {
+      prompt: "What can a Bloom filter prove when one of the query bits is unset?",
+      choices: [
+        "The item is definitely absent",
+        "The item is definitely present",
+        "The peer's whole document is corrupt"
+      ],
+      answer: 0,
+      explanation: "An unset bit is definitive absence. All bits set is only maybe-present."
+    },
+    {
+      prompt: "Why does sequence-key validation walk from HEAD?",
+      choices: [
+        "To prove list references are reachable before accepting incoming ops",
+        "To sort actor ids lexicographically",
+        "To compress the document into a bundle"
+      ],
+      answer: 0,
+      explanation: "A missing sequence key means an insert/update/delete points at an element that does not exist in the reachable list graph."
+    }
+  ]}
+/>

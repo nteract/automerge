@@ -1,6 +1,7 @@
 import type { ComponentType } from "react";
 import MentalModel from "./mental-model.mdx";
 import SourceMap from "./source-map.mdx";
+import DataStructures from "./data-structures.mdx";
 import SyncProtocol from "./sync-protocol.mdx";
 import PatchLogs from "./patch-logs.mdx";
 import BugLab from "./bug-lab.mdx";
@@ -36,6 +37,20 @@ export const docs: DocEntry[] = [
       "Know where changes enter, where they become ops, and where storage rebuilds state.",
     sources: ["rust/automerge/src/automerge.rs", "rust/automerge/src/storage"],
     Component: SourceMap,
+  },
+  {
+    slug: "data-structures",
+    title: "Data Structures And Algorithms",
+    kicker: "Mechanics",
+    level: "Play",
+    summary:
+      "Interact with Bloom filters, change graph closure, and sequence-key reachability.",
+    sources: [
+      "rust/automerge/src/sync/bloom.rs",
+      "rust/automerge/src/change_graph.rs",
+      "rust/automerge/src/op_set2/change/batch.rs",
+    ],
+    Component: DataStructures,
   },
   {
     slug: "sync-protocol",
