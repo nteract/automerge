@@ -5,8 +5,8 @@ use std::num::NonZeroU32;
 use std::ops::Add;
 
 use hexane::{
-    ColGroupIter, ColumnCursor, ColumnData, ColumnDataIter, DeltaCursor, PackError, StrCursor,
-    UIntCursor,
+    ColGroupItem, ColGroupIter, ColumnCursor, ColumnData, ColumnDataIter, DeltaCursor, PackError,
+    StrCursor, UIntCursor,
 };
 
 use crate::storage::BundleMetadata;
@@ -340,11 +340,7 @@ impl ChangeGraph {
             let num_ops = *self.num_ops.get(i).flatten().unwrap_or_default();
             let message = self.messages.get(i).flatten();
 
-            // FIXME - this needs a test
-            let meta = self.extra_bytes_meta.get_with_acc(i).unwrap();
-            let meta_range =
-                meta.acc.as_usize()..(meta.acc.as_usize() + meta.item.unwrap().length());
-            let extra = Cow::Borrowed(&self.extra_bytes_raw[meta_range]);
+            let extra = self.extra_bytes_for_index(i);
 
             let deps = self
                 .parents(index)
@@ -416,11 +412,7 @@ impl ChangeGraph {
                 let num_ops = *self.num_ops.get(i).flatten().unwrap_or_default();
                 let message = self.messages.get(i).flatten();
 
-                // FIXME - this needs a test
-                let meta = self.extra_bytes_meta.get_with_acc(i).unwrap();
-                let meta_range =
-                    meta.acc.as_usize()..(meta.acc.as_usize() + meta.item.unwrap().length());
-                let extra = Cow::Borrowed(&self.extra_bytes_raw[meta_range]);
+                let extra = self.extra_bytes_for_index(i);
 
                 let deps = self.parents(index).map(|p| p.0 as u64).collect::<Vec<_>>();
                 let start_op = max_op - num_ops + 1;
@@ -458,6 +450,27 @@ impl ChangeGraph {
         change_indexes.sort_unstable();
 
         change_indexes
+    }
+
+    fn extra_bytes_for_index(&self, index: usize) -> Cow<'_, [u8]> {
+        let Some(meta) = self.extra_bytes_meta.get_with_acc(index) else {
+            return Cow::Borrowed(&[]);
+        };
+        self.extra_bytes_from_meta(&meta)
+    }
+
+    fn extra_bytes_from_meta<'a>(&'a self, meta: &ColGroupItem<'_, ValueMeta>) -> Cow<'a, [u8]> {
+        let Some(item) = meta.item.as_deref() else {
+            return Cow::Borrowed(&[]);
+        };
+        let start = meta.acc.as_usize();
+        let Some(end) = start.checked_add(item.length()) else {
+            return Cow::Borrowed(&[]);
+        };
+        match self.extra_bytes_raw.get(start..end) {
+            Some(bytes) => Cow::Borrowed(bytes),
+            None => Cow::Borrowed(&[]),
+        }
     }
 
     pub(crate) fn get_hashes(&self, have_deps: &[ChangeHash]) -> Cow<'_, [ChangeHash]> {
@@ -796,6 +809,7 @@ impl ChangeGraphCols {
         let timestamps = ColumnData::load_unless_empty(time_bytes, len)?;
         let messages = ColumnData::load_unless_empty(message_bytes, len)?;
         let extra_bytes_meta = ColumnData::load_unless_empty(extra_meta_bytes, len)?;
+        validate_extra_bytes_meta(&extra_bytes_meta, extra_bytes_raw.len())?;
 
         if max_ops.len() != len {
             return Err(LoadError::InvalidColumnLength(MAX_OP_COL_SPEC));
@@ -884,6 +898,26 @@ impl ChangeGraphCols {
     }
 }
 
+fn validate_extra_bytes_meta(
+    meta: &ColumnData<MetaCursor>,
+    extra_bytes_len: usize,
+) -> Result<(), LoadError> {
+    for entry in meta.iter().with_acc() {
+        let start = entry.acc.as_usize();
+        let length = entry.item.as_deref().map(ValueMeta::length).unwrap_or(0);
+        let end = start
+            .checked_add(length)
+            .ok_or(LoadError::InvalidExtraBytes)?;
+        if end > extra_bytes_len {
+            return Err(LoadError::InvalidExtraBytes);
+        }
+    }
+    if meta.acc().as_usize() != extra_bytes_len {
+        return Err(LoadError::InvalidExtraBytes);
+    }
+    Ok(())
+}
+
 fn as_num_deps(num: usize) -> Option<Cow<'static, u64>> {
     Some(Cow::Owned(num as u64))
 }
@@ -968,6 +1002,25 @@ mod tests {
         assert_eq!(changes, expected_changes);
     }
 
+    #[test]
+    fn change_iter_nth_returns_extra_bytes_for_selected_change() -> Result<(), String> {
+        let mut builder = TestGraphBuilder::new();
+        let actor = builder.actor();
+        let change1 = builder.change_with_extra(&actor, 1, &[], vec![1]);
+        let change2 = builder.change_with_extra(&actor, 1, &[change1], vec![2, 2]);
+        builder.change_with_extra(&actor, 1, &[change2], vec![3, 3, 3]);
+
+        let graph = builder.build();
+        let change = graph
+            .iter()
+            .nth(2)
+            .ok_or_else(|| "missing third change metadata".to_string())?;
+        if change.extra.as_ref() != [3, 3, 3] {
+            return Err(format!("wrong extra bytes from nth: {:?}", change.extra));
+        }
+        Ok(())
+    }
+
     struct TestGraphBuilder {
         actors: Vec<ActorId>,
         changes: Vec<Change>,
@@ -1005,6 +1058,16 @@ mod tests {
             actor: &ActorId,
             num_new_ops: usize,
             parents: &[ChangeHash],
+        ) -> ChangeHash {
+            self.change_with_extra(actor, num_new_ops, parents, vec![])
+        }
+
+        fn change_with_extra(
+            &mut self,
+            actor: &ActorId,
+            num_new_ops: usize,
+            parents: &[ChangeHash],
+            extra: Vec<u8>,
         ) -> ChangeHash {
             let osd = OpSet::from_actors(self.actors.clone(), TextEncoding::platform_default());
 
@@ -1052,7 +1115,7 @@ mod tests {
                 start_op,
                 timestamp,
                 message: None,
-                extra: Cow::Owned(vec![]),
+                extra: Cow::Owned(extra),
             };
             let change = Change::new(build_change(&ops, &meta, &self.graph, &osd.actors));
             *seq = seq.checked_add(1).unwrap();
@@ -1137,9 +1200,8 @@ impl<'a> Iterator for ChangeIter<'a> {
         let message = self.messages.next().flatten();
         let start_op = max_op - num_ops + 1;
 
-        let meta = self.extra_bytes_meta.next()?;
-        let meta_range = meta.acc.as_usize()..(meta.acc.as_usize() + meta.item.unwrap().length());
-        let extra = Cow::Borrowed(&self.graph.extra_bytes_raw[meta_range]);
+        let extra_meta = self.extra_bytes_meta.next()?;
+        let extra = self.graph.extra_bytes_from_meta(&extra_meta);
         let deps = self
             .graph
             .parents(NodeIdx(i as u32))
@@ -1170,9 +1232,9 @@ impl<'a> Iterator for ChangeIter<'a> {
         let message = self.messages.nth(0).flatten();
         let start_op = max_op - num_ops + 1;
 
-        let meta = self.extra_bytes_meta.shift_acc(0)?;
-        let meta_range = meta.acc.as_usize()..(meta.acc.as_usize() + meta.item.unwrap().length());
-        let extra = Cow::Borrowed(&self.graph.extra_bytes_raw[meta_range]);
+        self.extra_bytes_meta.advance_by(n);
+        let extra_meta = self.extra_bytes_meta.next()?;
+        let extra = self.graph.extra_bytes_from_meta(&extra_meta);
 
         let deps = self
             .graph
