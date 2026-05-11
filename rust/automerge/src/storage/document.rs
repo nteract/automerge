@@ -388,6 +388,8 @@ pub(crate) enum ReconstructError {
     InvalidColumnLength(ColumnSpec),
     #[error("invalid change dependency index {0}")]
     InvalidChangeDepIndex(usize),
+    #[error("invalid extra bytes metadata")]
+    InvalidExtraBytes,
     #[error("max_op is lower than start_op")]
     InvalidMaxOp,
     #[error(transparent)]
@@ -418,9 +420,10 @@ mod tests {
 
     use super::*;
     use crate::{
+        legacy::{Key, ObjectId, Op, OpType, SortedVec},
         storage::{columns::ColumnId, parse, Chunk},
         transaction::Transactable,
-        AutoCommit, Automerge, ROOT,
+        AutoCommit, Automerge, Change, ROOT,
     };
 
     fn rewrite_document_checksum(bytes: &mut [u8]) {
@@ -509,6 +512,81 @@ mod tests {
             "expected load error without panic, got {result:?}"
         );
 
+        Ok(())
+    }
+
+    fn root_put_change_with_extra(extra: Vec<u8>) -> Result<Change, String> {
+        let op = Op {
+            action: OpType::Put(crate::ScalarValue::Str("value".into())),
+            obj: ObjectId::Root,
+            key: Key::Map("key".into()),
+            pred: SortedVec::new(),
+            insert: false,
+        };
+        let stored = crate::storage::Change::builder()
+            .with_actor(ActorId::from(&b"aa"[..]))
+            .with_seq(1)
+            .with_start_op(
+                std::num::NonZeroU64::new(1).ok_or_else(|| "invalid start op".to_string())?,
+            )
+            .with_timestamp(0)
+            .with_extra_bytes(extra)
+            .build([op].iter())
+            .map_err(|err| err.to_string())?;
+        Ok(Change::new(stored))
+    }
+
+    #[test]
+    fn load_document_with_invalid_extra_bytes_meta_returns_error_without_panic(
+    ) -> Result<(), String> {
+        let mut doc = Automerge::new();
+        doc.apply_changes([root_put_change_with_extra(vec![1, 2])?])
+            .map_err(|err| err.to_string())?;
+
+        let mut bytes = doc.save_nocompress();
+        let two_extra_bytes_meta = (2_u8 << 4) | 7;
+        let three_extra_bytes_meta = (3_u8 << 4) | 7;
+        let extra_meta_byte = {
+            let (_, chunk) =
+                Chunk::parse(parse::Input::new(&bytes)).map_err(|err| err.to_string())?;
+            let Chunk::Document(parsed) = chunk else {
+                return Err("expected document chunk".to_string());
+            };
+
+            let extra_meta_spec = ColumnSpec::new_value_metadata(ColumnId::new(5));
+            let range = parsed
+                .change_meta()
+                .as_map()
+                .get(&extra_meta_spec)
+                .ok_or_else(|| "missing extra metadata column".to_string())?
+                .clone();
+            let metadata_offset = range
+                .end
+                .checked_sub(1)
+                .ok_or_else(|| "empty extra metadata column".to_string())?;
+            let metadata_byte = parsed
+                .change_bytes()
+                .get(metadata_offset)
+                .ok_or_else(|| "missing extra metadata byte".to_string())?;
+            if *metadata_byte != two_extra_bytes_meta {
+                return Err(format!(
+                    "expected metadata for two extra bytes, got {metadata_byte}"
+                ));
+            }
+            parsed.change_bytes.start + metadata_offset
+        };
+
+        let byte = bytes
+            .get_mut(extra_meta_byte)
+            .ok_or_else(|| "missing extra metadata byte in document chunk".to_string())?;
+        *byte = three_extra_bytes_meta;
+        rewrite_document_checksum(&mut bytes);
+
+        let result = std::panic::catch_unwind(|| Automerge::load(&bytes));
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "expected load error without panic, got {result:?}"
+        );
         Ok(())
     }
 }
