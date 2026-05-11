@@ -340,7 +340,7 @@ impl<'a> Document<'a> {
 
         op_set.set_indexes(index);
 
-        let change_graph = change_cols.finalize(&changes.changes);
+        let change_graph = change_cols.finalize(&changes.changes, changes.heads.clone());
 
         debug_assert_eq!(changes.changes.len(), change_graph.len());
 
@@ -586,6 +586,41 @@ mod tests {
         assert!(
             matches!(result, Ok(Err(_))),
             "expected load error without panic, got {result:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn load_unverified_heads_can_be_saved_without_panic() -> Result<(), String> {
+        let mut doc = AutoCommit::new();
+        doc.put(ROOT, "a", 1).map_err(|err| err.to_string())?;
+        doc.commit();
+
+        let mut bytes = doc.save_nocompress();
+        let original_head = doc
+            .get_heads()
+            .into_iter()
+            .next()
+            .ok_or_else(|| "document should have a head".to_string())?;
+        let head_offset = bytes
+            .windows(original_head.as_bytes().len())
+            .position(|window| window == original_head.as_bytes())
+            .ok_or_else(|| "missing document head bytes".to_string())?;
+        bytes[head_offset] ^= 0xff;
+        rewrite_document_checksum(&mut bytes);
+
+        let verified_load = std::panic::catch_unwind(|| Automerge::load(&bytes));
+        assert!(
+            matches!(verified_load, Ok(Err(_))),
+            "expected verified load error without panic, got {verified_load:?}"
+        );
+
+        let loaded = Automerge::load_unverified_heads(&bytes).map_err(|err| err.to_string())?;
+        assert_eq!(loaded.get_heads(), vec![original_head]);
+        let result = std::panic::catch_unwind(|| loaded.save_and_verify());
+        assert!(
+            matches!(result, Ok(Ok(_))),
+            "expected unverified load to produce a saveable document, got {result:?}"
         );
         Ok(())
     }

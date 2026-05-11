@@ -754,7 +754,7 @@ impl ChangeGraphCols {
         self.0.iter()
     }
 
-    pub(crate) fn finalize(self, changes: &[Change]) -> ChangeGraph {
+    pub(crate) fn finalize(self, changes: &[Change], heads: BTreeSet<ChangeHash>) -> ChangeGraph {
         let mut graph = self.0;
         debug_assert_eq!(changes.len(), graph.len());
         debug_assert!(graph.hashes.is_empty());
@@ -771,6 +771,8 @@ impl ChangeGraphCols {
                 graph.cache_clock(NodeIdx(n));
             }
         }
+
+        graph.heads = heads;
 
         graph
     }

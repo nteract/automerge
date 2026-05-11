@@ -734,7 +734,8 @@ impl Automerge {
 
     /// Load a document without verifying the head hashes
     ///
-    /// This is useful for debugging as it allows you to examine a corrupted document.
+    /// This is useful for debugging as it allows you to examine a corrupted document. The loaded
+    /// document uses the heads derived from its reconstructed changes.
     pub fn load_unverified_heads(data: &[u8]) -> Result<Self, AutomergeError> {
         Self::load_with_options(
             data,
