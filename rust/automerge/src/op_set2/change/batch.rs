@@ -793,14 +793,28 @@ impl BatchApply {
         }
     }
 
-    fn actors_after_new_changes(&self, doc: &Automerge) -> Vec<ActorId> {
+    fn actors_and_obj_index_after_new_changes(&self, doc: &Automerge) -> (Vec<ActorId>, ObjIndex) {
         let mut actors = doc.ops().actors.clone();
+        let mut obj_info = doc.ops().obj_info.clone();
+
         for c in self.changes.iter().filter(|c| c.seq() == 1) {
             if let Err(index) = actors.binary_search(c.actor_id()) {
+                if actors.len() != index {
+                    obj_info = ObjIndex(
+                        obj_info
+                            .0
+                            .iter()
+                            .map(|(id, info)| {
+                                (id.with_new_actor(index), info.with_new_actor(index))
+                            })
+                            .collect(),
+                    );
+                }
                 actors.insert(index, c.actor_id().clone());
             }
         }
-        actors
+
+        (actors, obj_info)
     }
 
     fn imported_ops(&self, actors: &[ActorId]) -> Result<Vec<Vec<ChangeOp>>, AutomergeError> {
@@ -809,6 +823,30 @@ impl BatchApply {
             imported.push(Automerge::import_change_ops(actors, change)?);
         }
         Ok(imported)
+    }
+
+    fn validate_imported_ops_objects(
+        &self,
+        mut obj_info: ObjIndex,
+        imported: &[Vec<ChangeOp>],
+    ) -> Result<(), AutomergeError> {
+        for ops in imported {
+            for op in ops {
+                if let Some(info) = op.obj_info() {
+                    obj_info.insert(op.id(), info);
+                }
+            }
+        }
+
+        for ops in imported {
+            for op in ops {
+                if obj_info.object_type(&op.bld.obj).is_none() {
+                    return Err(AutomergeError::InvalidObjId(format!("{:?}", op.bld.obj)));
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn import_ops(&mut self, doc: &mut Automerge, imported: Vec<Vec<ChangeOp>>) {
@@ -824,10 +862,11 @@ impl BatchApply {
         doc: &mut Automerge,
         log: &mut PatchLog,
     ) -> Result<(), AutomergeError> {
-        let actors = self.actors_after_new_changes(doc);
+        let (actors, obj_info) = self.actors_and_obj_index_after_new_changes(doc);
         let mut migrated_log = log.clone();
         migrated_log.migrate_actors(&actors)?;
         let imported = self.imported_ops(&actors)?;
+        self.validate_imported_ops_objects(obj_info, &imported)?;
 
         self.insert_new_actors(doc);
 
@@ -879,7 +918,7 @@ impl BatchApply {
                     );
                     walk_list(ut, doc_ops, &mut succ, log);
                 }
-                _ => panic!("Obj {:?} Missing from Index", os.obj),
+                _ => return Err(AutomergeError::InvalidObjId(format!("{:?}", os.obj))),
             }
         }
 
@@ -1249,6 +1288,37 @@ mod tests {
         );
         assert_eq!(doc.get(&ROOT, "valid").unwrap(), None);
         assert!(!doc.has_change(&valid_hash));
+    }
+
+    #[test]
+    fn apply_change_with_unknown_object_returns_error_without_panic() {
+        let actor = ActorId::try_from("aaaaaa").unwrap();
+        let op = crate::legacy::Op {
+            action: OpType::Put(crate::ScalarValue::Str("value".into())),
+            obj: ObjectId::Id(crate::legacy::OpId::new(1, &actor)),
+            key: Key::Map("key".into()),
+            pred: SortedVec::new(),
+            insert: false,
+        };
+        let stored = crate::storage::Change::builder()
+            .with_actor(actor)
+            .with_seq(1)
+            .with_start_op(NonZeroU64::new(1).unwrap())
+            .with_timestamp(0)
+            .build([op].iter())
+            .unwrap();
+        let change = Change::new(stored);
+        let hash = change.hash();
+        let mut doc = Automerge::new();
+
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| doc.apply_changes([change])));
+
+        assert!(
+            matches!(result, Ok(Err(AutomergeError::InvalidObjId(_)))),
+            "expected InvalidObjId without panic, got {result:?}"
+        );
+        assert!(!doc.has_change(&hash));
     }
 
     #[test]
