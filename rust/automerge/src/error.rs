@@ -43,6 +43,8 @@ pub enum AutomergeError {
     InvalidOp(ObjType),
     #[error("seq {0} is out of bounds")]
     InvalidSeq(u64),
+    #[error("invalid sequence key `{0}`")]
+    InvalidSeqKey(String),
     #[error("cursor {0} is invalid")]
     InvalidCursor(Cursor),
     #[error("op has no valid cursor")] // this error sucks
