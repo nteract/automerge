@@ -649,6 +649,9 @@ impl<'a> BundleChangeIterInner<'a> {
             .as_deref()
             .copied()
             .unwrap_or(0) as usize;
+        if extra_count > self.extra.len() {
+            return Err(ReadOpError::MissingValue("extra").into());
+        }
         let (extra, tail) = self.extra.split_at(extra_count);
         let extra = Cow::Borrowed(extra);
         self.extra = tail;
@@ -785,7 +788,11 @@ impl<'a> OpIterInner<'a> {
 
         let value_meta = self.meta.next().transpose()?.flatten();
         let value_meta = value_meta.ok_or(ReadOpError::MissingValue("value_meta"))?;
-        let (value_raw, tail) = self.value.split_at(value_meta.length());
+        let value_len = value_meta.length();
+        if value_len > self.value.len() {
+            return Err(ReadOpError::MissingValue("value").into());
+        }
+        let (value_raw, tail) = self.value.split_at(value_len);
         self.value = tail;
         let value = ScalarValue::from_raw(*value_meta, value_raw)
             .map_err(|_| ReadOpError::MissingValue("value"))?;
