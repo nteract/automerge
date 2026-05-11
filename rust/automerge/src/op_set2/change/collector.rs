@@ -182,7 +182,7 @@ impl<'a> OpEncoderStrategy<'a> {
         mapper.reset();
         match self {
             Self::Ops(mut v) => v.finish(change, mapper),
-            Self::Enc(e) => Ok(e.finish(change, mapper)),
+            Self::Enc(e) => e.finish(change, mapper),
             Self::Null => Err(Error::InvalidState),
         }
     }
@@ -274,12 +274,26 @@ impl<'a> OpEncoderStrategy<'a> {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct VecEncoder<'a> {
     data: Vec<Option<OpBuilder<'a>>>,
+    error: Option<VecEncoderError>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum VecEncoderError {
+    DuplicateOp,
+    InvalidIndex,
+}
+
+fn record_encoder_error(error: &mut Option<VecEncoderError>, new_error: VecEncoderError) {
+    if error.is_none() {
+        *error = Some(new_error);
+    }
 }
 
 impl<'a> VecEncoder<'a> {
     fn new(num_ops: u64) -> Self {
         Self {
             data: vec![None; num_ops as usize],
+            error: None,
         }
     }
 
@@ -288,7 +302,7 @@ impl<'a> VecEncoder<'a> {
         let mut data = Vec::new();
         data.try_reserve(num_ops).map_err(|_| OutOfMemory)?;
         data.extend(std::iter::repeat_n(None, num_ops));
-        Ok(Self { data })
+        Ok(Self { data, error: None })
     }
 
     fn num_ops(&self) -> u64 {
@@ -296,8 +310,15 @@ impl<'a> VecEncoder<'a> {
     }
 
     fn add(&mut self, index: usize, op: OpBuilder<'a>) {
-        assert!(self.data[index].is_none());
-        self.data[index] = Some(op);
+        let Some(slot) = self.data.get_mut(index) else {
+            record_encoder_error(&mut self.error, VecEncoderError::InvalidIndex);
+            return;
+        };
+        if slot.is_some() {
+            record_encoder_error(&mut self.error, VecEncoderError::DuplicateOp);
+            return;
+        }
+        *slot = Some(op);
     }
 
     fn finish(
@@ -305,6 +326,12 @@ impl<'a> VecEncoder<'a> {
         change: &BuildChangeMetadata<'_>,
         mapper: &mut ActorMapper<'_>,
     ) -> Result<ChangeCols, Error> {
+        if let Some(error) = self.error.take() {
+            return Err(match error {
+                VecEncoderError::DuplicateOp => Error::DuplicateOp,
+                VecEncoderError::InvalidIndex => Error::InvalidState,
+            });
+        }
         let start_pos = self.data.iter().position(|op| op.is_some()).unwrap_or(0);
         let ops = &self.data[start_pos..];
         if ops.iter().any(|o| o.is_none()) {
@@ -312,7 +339,9 @@ impl<'a> VecEncoder<'a> {
         }
 
         if let Some(Some(last)) = ops.last() {
-            assert_eq!(last.id.counter(), change.max_op);
+            if last.id.counter() != change.max_op {
+                return Err(Error::IncorrectMaxOp);
+            }
         }
 
         let mut data = vec![];
@@ -339,6 +368,7 @@ pub(crate) struct ProgressiveEncoder<'a> {
     pub(crate) len: usize,
     pub(crate) start_op: Option<u64>,
     pub(crate) num_ops: u64,
+    error: Option<VecEncoderError>,
     actors: Vec<bool>,
     queue: BTreeMap<usize, OpBuilder<'a>>,
     obj_actor: Encoder<'a, ActorCursor>,
@@ -384,6 +414,14 @@ impl<'a> ProgressiveEncoder<'a> {
     }
 
     fn add(&mut self, index: usize, op: OpBuilder<'a>) {
+        if index >= self.num_ops as usize {
+            record_encoder_error(&mut self.error, VecEncoderError::InvalidIndex);
+            return;
+        }
+        if index < self.len {
+            record_encoder_error(&mut self.error, VecEncoderError::DuplicateOp);
+            return;
+        }
         self.process_op(&op);
         if index == self.len {
             self.append(op);
@@ -392,8 +430,8 @@ impl<'a> ProgressiveEncoder<'a> {
                 self.append(op);
                 self.len += 1;
             }
-        } else {
-            self.queue.insert(index, op);
+        } else if self.queue.insert(index, op).is_some() {
+            record_encoder_error(&mut self.error, VecEncoderError::DuplicateOp);
         }
     }
 
@@ -506,8 +544,25 @@ impl<'a> ProgressiveEncoder<'a> {
         mut self,
         change: &BuildChangeMetadata<'_>,
         mapper: &mut ActorMapper<'_>,
-    ) -> ChangeCols {
+    ) -> Result<ChangeCols, Error> {
+        if let Some(error) = self.error.take() {
+            return Err(match error {
+                VecEncoderError::DuplicateOp => Error::DuplicateOp,
+                VecEncoderError::InvalidIndex => Error::InvalidState,
+            });
+        }
         self.flush();
+        if self.len as u64 != self.num_ops {
+            return Err(Error::MissingOps);
+        }
+        if self.num_ops > 0 {
+            let Some(start_op) = self.start_op else {
+                return Err(Error::MissingOps);
+            };
+            if start_op + self.num_ops - 1 != change.max_op {
+                return Err(Error::IncorrectMaxOp);
+            }
+        }
 
         let mut data = vec![];
         let num_ops = self.len as u64;
@@ -516,14 +571,14 @@ impl<'a> ProgressiveEncoder<'a> {
         let actor = mapper.actors[change.actor].clone();
         let other_actors = mapper.iter().collect();
 
-        ChangeCols {
+        Ok(ChangeCols {
             actor,
             other_actors,
             start_op,
             num_ops,
             data,
             meta,
-        }
+        })
     }
 }
 
@@ -974,6 +1029,21 @@ const CAN_OOM: bool = false;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::op_set2::types::{Action, ScalarValue};
+
+    fn test_op(counter: u64, prop: &'static str) -> OpBuilder<'static> {
+        OpBuilder {
+            id: OpId::new(counter, 0),
+            obj: ObjId::root(),
+            action: Action::Set,
+            key: KeyRef::Map(Cow::Borrowed(prop)),
+            value: ScalarValue::Int(counter as i64),
+            insert: false,
+            expand: false,
+            mark_name: None,
+            pred: Vec::new(),
+        }
+    }
 
     fn change_with_missing_dep() -> BuildChangeMetadata<'static> {
         BuildChangeMetadata {
@@ -983,6 +1053,20 @@ mod tests {
             timestamp: 0,
             message: None,
             deps: vec![1],
+            extra: Cow::Borrowed(&[]),
+            start_op: 1,
+            builder: 0,
+        }
+    }
+
+    fn change_with_max_op(max_op: u64) -> BuildChangeMetadata<'static> {
+        BuildChangeMetadata {
+            actor: 0,
+            seq: 1,
+            max_op,
+            timestamp: 0,
+            message: None,
+            deps: Vec::new(),
             extra: Cow::Borrowed(&[]),
             start_op: 1,
             builder: 0,
@@ -1029,5 +1113,78 @@ mod tests {
         let err = collector.unbundle(&actors, &[]).unwrap_err();
 
         assert!(matches!(err, Error::MissingOps));
+    }
+
+    #[test]
+    fn vec_encoder_returns_error_for_final_counter_mismatch() {
+        let actors = vec![ActorId::from(&b"aa"[..])];
+        let mut mapper = ActorMapper::new(&actors);
+        let mut encoder = VecEncoder::new(2);
+        encoder.add(0, test_op(1, "a"));
+        encoder.add(1, test_op(2, "b"));
+
+        let err = encoder
+            .finish(&change_with_max_op(3), &mut mapper)
+            .unwrap_err();
+
+        assert!(matches!(err, Error::IncorrectMaxOp));
+    }
+
+    #[test]
+    fn progressive_encoder_returns_error_for_duplicate_op_id() {
+        let actors = vec![ActorId::from(&b"aa"[..])];
+        let mut mapper = ActorMapper::new(&actors);
+        let mut encoder = ProgressiveEncoder::new(2);
+        encoder.add(0, test_op(1, "a"));
+        encoder.add(0, test_op(1, "b"));
+
+        let err = encoder
+            .finish(&change_with_max_op(1), &mut mapper)
+            .unwrap_err();
+
+        assert!(matches!(err, Error::DuplicateOp));
+    }
+
+    #[test]
+    fn progressive_encoder_returns_error_for_invalid_index() {
+        let actors = vec![ActorId::from(&b"aa"[..])];
+        let mut mapper = ActorMapper::new(&actors);
+        let mut encoder = ProgressiveEncoder::new(1);
+        encoder.add(1, test_op(1, "a"));
+
+        let err = encoder
+            .finish(&change_with_max_op(1), &mut mapper)
+            .unwrap_err();
+
+        assert!(matches!(err, Error::InvalidState));
+    }
+
+    #[test]
+    fn progressive_encoder_returns_error_for_missing_ops() {
+        let actors = vec![ActorId::from(&b"aa"[..])];
+        let mut mapper = ActorMapper::new(&actors);
+        let mut encoder = ProgressiveEncoder::new(2);
+        encoder.add(0, test_op(1, "a"));
+
+        let err = encoder
+            .finish(&change_with_max_op(2), &mut mapper)
+            .unwrap_err();
+
+        assert!(matches!(err, Error::MissingOps));
+    }
+
+    #[test]
+    fn progressive_encoder_returns_error_for_final_counter_mismatch() {
+        let actors = vec![ActorId::from(&b"aa"[..])];
+        let mut mapper = ActorMapper::new(&actors);
+        let mut encoder = ProgressiveEncoder::new(2);
+        encoder.add(0, test_op(1, "a"));
+        encoder.add(1, test_op(2, "b"));
+
+        let err = encoder
+            .finish(&change_with_max_op(3), &mut mapper)
+            .unwrap_err();
+
+        assert!(matches!(err, Error::IncorrectMaxOp));
     }
 }

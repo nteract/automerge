@@ -468,4 +468,47 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn load_document_with_duplicate_op_id_returns_error_without_panic() -> Result<(), String> {
+        use crate::storage::columns::ColumnId;
+
+        let mut doc = AutoCommit::new().with_actor(ActorId::from(&b"aa"[..]));
+        doc.put(ROOT, "a", 1).map_err(|err| err.to_string())?;
+        doc.commit();
+        let mut doc2 = AutoCommit::new().with_actor(ActorId::from(&b"bb"[..]));
+        doc2.put(ROOT, "b", 2).map_err(|err| err.to_string())?;
+        doc2.commit();
+        doc.merge(&mut doc2).map_err(|err| err.to_string())?;
+
+        let mut bytes = doc.save_nocompress();
+        let actor_byte = {
+            let (_, chunk) =
+                Chunk::parse(parse::Input::new(&bytes)).map_err(|err| err.to_string())?;
+            let Chunk::Document(parsed) = chunk else {
+                return Err("expected document chunk".to_string());
+            };
+
+            let id_actor_spec = ColumnSpec::new_actor(ColumnId::new(2));
+            let range = parsed
+                .op_metadata
+                .as_map()
+                .get(&id_actor_spec)
+                .ok_or_else(|| "missing id actor column".to_string())?
+                .clone();
+            assert_eq!(&parsed.op_raw_bytes()[range.clone()], &[126, 0, 1]);
+            parsed.op_bytes.start + range.end - 1
+        };
+
+        bytes[actor_byte] = 0;
+        rewrite_document_checksum(&mut bytes);
+
+        let result = std::panic::catch_unwind(|| Automerge::load(&bytes));
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "expected load error without panic, got {result:?}"
+        );
+
+        Ok(())
+    }
 }
