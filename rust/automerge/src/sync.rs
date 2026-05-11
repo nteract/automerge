@@ -203,9 +203,7 @@ impl SyncDoc for Automerge {
                 let hashes = self.change_graph.get_hashes(&[]);
                 MessageBuilder::new_v2(self.save(), hashes)
             } else {
-                let all_hashes = self
-                    .get_hashes_to_send(their_have, their_need)
-                    .expect("Should have only used hashes that are in the document");
+                let all_hashes = self.get_hashes_to_send(their_have, their_need);
                 // deduplicate the changes to send with those we have already sent and clone it now
                 let hashes: Vec<_> = all_hashes
                     .into_iter()
@@ -306,13 +304,12 @@ impl Automerge {
     }
 
     #[inline(never)]
-    fn get_hashes_to_send(
-        &self,
-        have: &[Have],
-        need: &[ChangeHash],
-    ) -> Result<Vec<ChangeHash>, AutomergeError> {
+    fn get_hashes_to_send(&self, have: &[Have], need: &[ChangeHash]) -> Vec<ChangeHash> {
         if have.is_empty() {
-            Ok(need.to_vec())
+            need.iter()
+                .filter(|hash| self.has_change(hash))
+                .copied()
+                .collect()
         } else {
             let mut last_sync_hashes = HashSet::new();
             let mut bloom_filters = Vec::with_capacity(have.len());
@@ -355,7 +352,7 @@ impl Automerge {
 
             let mut final_hashes = Vec::with_capacity(hashes_to_send.len() + need.len());
             for hash in need {
-                if !hashes_to_send.contains(hash) {
+                if self.has_change(hash) && !hashes_to_send.contains(hash) {
                     final_hashes.push(*hash);
                 }
             }
@@ -365,7 +362,7 @@ impl Automerge {
                     final_hashes.push(*hash);
                 }
             }
-            Ok(final_hashes)
+            final_hashes
         }
     }
 
@@ -962,6 +959,25 @@ mod tests {
 
         assert!(doc.sync().generate_sync_message(&mut sync_state).is_some());
         assert!(doc.sync().generate_sync_message(&mut sync_state).is_none());
+    }
+
+    #[test]
+    fn generate_sync_message_ignores_stale_needed_hashes() {
+        let mut doc = crate::AutoCommit::new();
+        doc.put(crate::ROOT, "key", "value").unwrap();
+        let known = doc.get_heads()[0];
+        let unknown = ChangeHash([42; 32]);
+
+        let mut sync_state = State::new();
+        sync_state.their_have = Some(Vec::new());
+        sync_state.their_need = Some(vec![unknown, known]);
+
+        let message = doc
+            .sync()
+            .generate_sync_message(&mut sync_state)
+            .expect("known requested hash should still be sent");
+
+        assert_eq!(message.changes.len(), 1);
     }
 
     #[test]
