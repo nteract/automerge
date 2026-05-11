@@ -1,0 +1,74 @@
+import { Callout } from "../components/Callout";
+import { SourceCard } from "../components/SourceCard";
+import { Quiz } from "../components/Quiz";
+
+## One state per peer
+
+Automerge sync is not a global document mode. Each peer pair needs its own
+`sync::State`. Reusing a state across a different peer, projection, document,
+or rebuilt local doc smuggles old assumptions into a new conversation.
+
+<SourceCard path="rust/automerge/src/sync/state.rs">
+Read the fields on `State`: `shared_heads`, `last_sent_heads`, `their_heads`,
+`their_need`, `their_have`, `sent_hashes`, `in_flight`, and read-only/reset
+flags. The comments are unusually useful.
+</SourceCard>
+
+## The loop
+
+The protocol assumes a reliable in-order stream between the two peers:
+
+```text
+generate message -> send -> receive message -> apply changes -> generate reply
+```
+
+`generate_sync_message` uses local heads, remote heads, bloom filters, explicit
+need hashes, and `sent_hashes` to decide what to send. `receive_sync_message`
+updates local sync state and may apply changes to the document.
+
+## Stale need hashes
+
+The current head of `desktop-patches` includes a sync reduction for stale need
+hashes. The lesson is not that need hashes are bad. The lesson is that the
+receiver should reason from the current local document, not from a stale
+per-peer memory that may describe a previous connection.
+
+<Callout title="Desktop boundary" tone="warning">
+When desktop closes a peer and later reconnects, the new peer should use a fresh
+Automerge sync state unless it is intentionally resuming the exact same peer
+conversation.
+</Callout>
+
+## Read-only mode and reset
+
+Read-only peers advertise that they ignore incoming changes. When a state flips
+from read-only to read-write, the implementation resets enough sync memory to
+make the remote resend changes that were previously ignored.
+
+## Knowledge check
+
+<Quiz
+  title="Sync protocol check"
+  questions={[
+    {
+      prompt: "What should happen to sync state when a client reconnects as a new peer?",
+      choices: [
+        "Reuse any state for the same document path",
+        "Start fresh unless intentionally resuming the same peer conversation",
+        "Copy the daemon room's state into every client"
+      ],
+      answer: 1,
+      explanation: "Automerge sync state is per peer, not per file path or room."
+    },
+    {
+      prompt: "What does `in_flight` protect against?",
+      choices: [
+        "Generating duplicate sync messages while waiting for acknowledgement",
+        "Loading compressed document chunks",
+        "Writing two top-level map keys at once"
+      ],
+      answer: 0,
+      explanation: "The field suppresses repeated sends while the peer has not acknowledged prior heads."
+    }
+  ]}
+/>

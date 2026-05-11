@@ -1,0 +1,112 @@
+import { Callout } from "../components/Callout";
+import { SourceCard } from "../components/SourceCard";
+import { Quiz } from "../components/Quiz";
+
+## What the bug lab is for
+
+This page is a study guide for the `desktop-patches` fork stack, not a claim
+that every patch is upstream-final. Each row answers: what was the panic or bad
+acceptance shape, where should you read it, and what policy should desktop infer
+from the returned error?
+
+<Callout title="Provisional patch stance" tone="warning">
+Treat these as reduced evidence. A patch graduates only when the reduction and
+fix hold up against Automerge itself or are replaced by a better upstream
+solution.
+</Callout>
+
+<table className="bugTable">
+  <thead>
+    <tr>
+      <th>Class</th>
+      <th>Regression shape</th>
+      <th>Returned signal</th>
+      <th>Desktop policy</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Patch log mismatch</td>
+      <td>Active patch log from one actor table reused with another document.</td>
+      <td><code>PatchLogMismatch</code></td>
+      <td>Recover by rebuilding local projection and resetting peer state.</td>
+    </tr>
+    <tr>
+      <td>Unknown actor/object</td>
+      <td>Incoming batch references an actor or object missing from the post-change indexes.</td>
+      <td><code>InvalidActorId</code> or <code>InvalidObjId</code></td>
+      <td>Close/report peer boundary; do not blindly rebuild and replay.</td>
+    </tr>
+    <tr>
+      <td>Bad sequence graph</td>
+      <td>Actor sequence gaps or list ops pointing at missing element ids.</td>
+      <td><code>InvalidSeq</code> or <code>InvalidSeqKey</code></td>
+      <td>Capture causality/fanout context; same frame should remain invalid.</td>
+    </tr>
+    <tr>
+      <td>Counter overflow</td>
+      <td>Inbound or local write would allocate an op counter above the supported range.</td>
+      <td><code>InvalidOpCounter</code></td>
+      <td>Treat as unsupported/malformed history state, not recoverable skew.</td>
+    </tr>
+    <tr>
+      <td>Malformed saved document</td>
+      <td>Bad dependency indexes, duplicate op ids, invalid extra metadata, bad heads.</td>
+      <td>Load or reconstruct errors</td>
+      <td>Reject load or derive safe internal state for unverified debug loads.</td>
+    </tr>
+    <tr>
+      <td>Malformed bundle</td>
+      <td>Bundle metadata says values or extra bytes exist where columns do not support it.</td>
+      <td><code>Unbundle</code> with parse detail</td>
+      <td>Reject bundle content; do not patch desktop recovery policy.</td>
+    </tr>
+  </tbody>
+</table>
+
+<SourceCard path="rust/automerge/tests/test.rs">
+Look for regression names around `PatchLogMismatch`, `missing_sequence`,
+`InvalidSeqKey`, and fork actor invariants. Tests are often the clearest entry
+point because they state the malformed shape directly.
+</SourceCard>
+
+<SourceCard path="rust/automerge/src/storage/document.rs">
+The document chunk tests mutate saved bytes, recompute checksums, and verify
+`Automerge::load` returns errors instead of unwinding.
+</SourceCard>
+
+## How to add the next reduction
+
+1. Start from the exact panic text or bad acceptance symptom.
+2. Build the smallest Automerge-only test.
+3. Assert both "no panic" and "no partial mutation" when mutation was possible.
+4. Patch the earliest validation boundary.
+5. Decide whether the resulting error is recoverable local skew or invalid data.
+
+## Knowledge check
+
+<Quiz
+  title="Bug lab check"
+  questions={[
+    {
+      prompt: "A peer sends a change that targets a missing object id. What is the better first reaction?",
+      choices: [
+        "Rebuild and replay forever",
+        "Treat it as invalid or causally incomplete peer input and capture context",
+        "Silently add a fake object"
+      ],
+      answer: 1,
+      explanation: "A rebuild cannot invent an object that is absent from the incoming causal history."
+    },
+    {
+      prompt: "What extra assertion should a regression include when a panic used to happen after partial mutation?",
+      choices: [
+        "That the rejected change was not recorded in document history",
+        "That the error string contains the word panic",
+        "That JavaScript packaging still runs first"
+      ],
+      answer: 0,
+      explanation: "No-panic is not enough if the document has already been corrupted or partially advanced."
+    }
+  ]}
+/>

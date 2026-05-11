@@ -1,0 +1,113 @@
+import { Callout } from "../components/Callout";
+import { SourceCard } from "../components/SourceCard";
+import { Quiz } from "../components/Quiz";
+
+## The main entry points
+
+Read the Rust core as a pipeline:
+
+1. Public APIs in `Automerge` and `AutoCommit` accept local changes, sync
+   messages, or saved bytes.
+2. Changes become imported operations against actor and object indexes.
+3. The change graph records causal history and heads.
+4. The op set answers materialized state queries.
+5. Patch logs optionally describe how a caller should update a view.
+
+<SourceCard path="rust/automerge/src/automerge.rs">
+This is the lower-level document API. Look for `apply_changes`, load/save
+paths, `receive_sync_message_log_patches`, and bundle helpers.
+</SourceCard>
+
+<SourceCard path="rust/automerge/src/autocommit.rs">
+This wrapper owns automatic transactions, isolation, integration, patch logs,
+and the sync trait implementation used heavily by application code.
+</SourceCard>
+
+## Where malformed input becomes dangerous
+
+Most desktop-patches fixes move checks earlier. That pattern matters more than
+any single error type. A good boundary rejects a malformed change before it:
+
+- inserts new actors into the op set
+- imports operations
+- updates history
+- exposes a patch log
+- lets hydrate/read APIs observe invalid state
+
+<Callout title="Patch-stack pattern" tone="proof">
+Many fixes are preflight validations. They turn "panic after partial mutation"
+or "invalid state accepted" into "typed error before mutation."
+</Callout>
+
+## Source tour
+
+<table>
+  <thead>
+    <tr>
+      <th>Question</th>
+      <th>First file</th>
+      <th>Why it matters</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>How are changes applied?</td>
+      <td><code>op_set2/change/batch.rs</code></td>
+      <td>Batch preflight, actor insertion, import, and history mutation.</td>
+    </tr>
+    <tr>
+      <td>How are saved documents rebuilt?</td>
+      <td><code>storage/document.rs</code></td>
+      <td>Reconstructs op set and change graph from columns.</td>
+    </tr>
+    <tr>
+      <td>How are bundle chunks unpacked?</td>
+      <td><code>storage/bundle.rs</code></td>
+      <td>Experimental compressed subset format.</td>
+    </tr>
+    <tr>
+      <td>How are patches generated?</td>
+      <td><code>patches/patch_log.rs</code></td>
+      <td>Tracks relative view changes and actor-table ownership.</td>
+    </tr>
+    <tr>
+      <td>How does sync decide what to send?</td>
+      <td><code>sync.rs</code></td>
+      <td>Computes heads, need, have, bloom filters, and sent hashes.</td>
+    </tr>
+  </tbody>
+</table>
+
+## Practical reading order
+
+Start with a test name from the bug lab. Read the test first, then the changed
+validator, then the caller that invokes the validator before mutation. This is
+usually faster than starting at the public API and following every abstraction.
+
+## Knowledge check
+
+<Quiz
+  title="Source map check"
+  questions={[
+    {
+      prompt: "What is the safest place to reject malformed incoming changes?",
+      choices: [
+        "After `update_history` so the error has a hash",
+        "Before actor insertion, op import, history mutation, or patch exposure",
+        "Inside UI recovery code"
+      ],
+      answer: 1,
+      explanation: "The patch stack repeatedly moves validation before mutation."
+    },
+    {
+      prompt: "Which file should you inspect first for batch-apply malformed change reductions?",
+      choices: [
+        "rust/automerge/src/op_set2/change/batch.rs",
+        "rust/automerge/src/text_diff/myers.rs",
+        "rust/automerge/src/cursor.rs"
+      ],
+      answer: 0,
+      explanation: "Most invalid actor/object/sequence/op-counter apply fixes live in batch apply."
+    }
+  ]}
+/>

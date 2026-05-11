@@ -1,0 +1,77 @@
+import { Callout } from "../components/Callout";
+import { SourceCard } from "../components/SourceCard";
+import { Quiz } from "../components/Quiz";
+
+## The smallest useful model
+
+Automerge stores a document as a causally ordered set of changes. Each change
+belongs to one actor, has a monotonically increasing sequence number for that
+actor, depends on earlier change hashes, and contains operations that target
+objects.
+
+The important trick is that "current state" is derived. The durable data is the
+change graph plus the op set. The visible map value, list order, text span, or
+conflict set is a query over those structures at a set of heads.
+
+<Callout title="Invariant to keep in your head" tone="proof">
+An actor id is a linear stream. Two documents that share an actor id and write
+concurrently are not two branches of the same actor; they are a duplicate
+sequence risk.
+</Callout>
+
+## Objects and operation ids
+
+`ObjId` and `OpId` are internal coordinates. The root object is special, and
+new nested objects are introduced by operations. Lists and text also use element
+ids so later operations can target positions without relying on fragile numeric
+indexes.
+
+<SourceCard path="rust/automerge/src/types.rs">
+Start with `ActorId`, `ObjType`, `OpId`, `ObjId`, `ElemId`, and the root/head
+constants. This file is not the whole system, but it gives names to the atoms
+used everywhere else.
+</SourceCard>
+
+## Heads
+
+Heads are the frontier of a change graph. If a document has every change
+reachable from a head, it can materialize the state represented by that head.
+Multiple heads mean concurrent frontier changes.
+
+That is why desktop snapshot logic can use "all advertised non-empty heads are
+present locally" as a one-shot catch-up condition. It proves the receiver has
+that advertised frontier, not that it will stay current after disconnecting.
+
+## What changes during reads?
+
+Reads should not mutate the change graph. They may hydrate or walk data
+structures, but they are interpreting existing changes. Writes allocate new
+ops, place them in a transaction, and commit a new change into the graph.
+
+## Knowledge check
+
+<Quiz
+  title="Mental model check"
+  questions={[
+    {
+      prompt: "What does a document head represent?",
+      choices: [
+        "A frontier change hash whose dependencies describe a materializable state",
+        "The newest operation id in every object",
+        "The current websocket peer id"
+      ],
+      answer: 0,
+      explanation: "Heads are change hashes. Operations and peers are separate concepts."
+    },
+    {
+      prompt: "Why is forcing a fork to reuse the original actor id risky?",
+      choices: [
+        "It makes all list indexes start at zero again",
+        "It can create two concurrent writes with the same actor sequence stream",
+        "It disables compression"
+      ],
+      answer: 1,
+      explanation: "Actor id plus sequence number defines a linear change stream."
+    }
+  ]}
+/>

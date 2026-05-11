@@ -1,0 +1,68 @@
+import { Callout } from "../components/Callout";
+import { SourceCard } from "../components/SourceCard";
+import { Quiz } from "../components/Quiz";
+
+## Patch logs are view deltas
+
+A patch log records relative changes so a caller can update a materialized view.
+It is not the source of truth. The document's changes and op set are the source
+of truth; patches are the caller-facing explanation of what moved.
+
+<SourceCard path="rust/automerge/src/patches/patch_log.rs">
+Read `PatchLog`, `Event`, `migrate_actors`, `branch`, and `merge`. The actor
+table migration is the part that matters for the desktop panic class.
+</SourceCard>
+
+## Why mismatch is recoverable
+
+Patch logs contain actor-indexed data. If a patch log created for one document
+actor table is reused with another document actor table, the indexes can stop
+meaning what the caller thinks they mean. The fork patch set turns several
+former unwraps into `AutomergeError::PatchLogMismatch`.
+
+That error is different from invalid incoming change data. It can describe local
+view/update machinery becoming stale, so rebuilding the local projection and
+resetting peer sync state can be a meaningful recovery attempt.
+
+<Callout title="Recoverable is intentionally narrow" tone="proof">
+`PatchLogMismatch` is the main error that desktop should treat as rebuildable.
+Errors like `InvalidObjId`, `InvalidSeqKey`, or `InvalidOpCounter` are evidence
+about malformed or causally incomplete input, not a generic retry condition.
+</Callout>
+
+## Transaction constructor fixes
+
+The `desktop-patches` stack makes AutoCommit transaction setup fallible instead
+of unwrapping actor migration failures. It also adds `try_commit` and
+`try_commit_with` so callers that care can observe setup errors directly.
+
+The legacy `commit` and `commit_with` API shape remains compatibility-oriented:
+it returns `None` on setup failure rather than exposing a new error type.
+
+## Knowledge check
+
+<Quiz
+  title="Patch log check"
+  questions={[
+    {
+      prompt: "Why can `PatchLogMismatch` be a sensible rebuild signal?",
+      choices: [
+        "It proves the remote peer sent invalid bytes",
+        "It can mean local patch/view state no longer matches the document actor table",
+        "It means every peer must be evicted permanently"
+      ],
+      answer: 1,
+      explanation: "Rebuilding the local projection can replace stale patch-log state."
+    },
+    {
+      prompt: "Should `InvalidSeqKey` be added to the same recoverable policy by default?",
+      choices: [
+        "No, it is malformed or causally incomplete input evidence",
+        "Yes, every Automerge error should be retried",
+        "Only if the UI is hidden"
+      ],
+      answer: 0,
+      explanation: "Retrying the same malformed change should not make a missing sequence key valid."
+    }
+  ]}
+/>

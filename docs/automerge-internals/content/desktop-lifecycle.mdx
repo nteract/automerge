@@ -1,0 +1,78 @@
+import { Callout } from "../components/Callout";
+import { SourceCard } from "../components/SourceCard";
+import { Quiz } from "../components/Quiz";
+
+## The nteract shape
+
+Desktop uses the daemon as a hub. Tauri windows, runtime agents, MCP/Python/Node
+bindings, and short-lived command clients can all act as Automerge peers. That
+means the lifecycle of a peer is as important as the bytes in a sync message.
+
+## Closing a peer is not the same as healing a document
+
+When a peer is closed, that peer's sync task and peer-specific sync state are
+dead. A later connection can create a fresh peer and fresh `sync::State`, then
+catch up from the daemon room or persisted document state.
+
+The subtle part is corruption policy. If the daemon-side room document panicked
+while mutating, closing one peer does not prove the shared in-memory room is
+healthy. That is why unrecoverable panic paths should eventually quarantine or
+reload suspect room state, not merely close one socket and keep serving other
+peers from the same memory.
+
+<Callout title="Good reconnect test" tone="proof">
+Simulate two peers. Make one peer hit a deterministic sync-boundary failure.
+Verify only that peer closes, the other peer remains useful, the failed peer
+reconnects with fresh sync state, and convergence resumes without replaying the
+bad frame.
+</Callout>
+
+## Snapshot vs watcher
+
+A snapshot client may stop once it has all non-empty heads advertised by the
+daemon. That proves it reached one frontier. A watcher has a different job: it
+must continue draining the stream because new heads can arrive after the
+snapshot frontier.
+
+## What to ask desktop to prove
+
+- Reconnect creates a new peer identity and fresh sync state.
+- Existing handles surface disconnected rather than pretending to be live.
+- Runtime-agent sync failures do not leave hidden stale state.
+- Daemon room eviction flushes before removing the last in-memory room.
+- Panic containment labels include peer role, document kind, direction, heads,
+  and exact error/panic text.
+
+<SourceCard path=".context/nteract-coordination.md">
+This local coordination file captures the nightly investigation, desktop
+roles, and provisional policy decisions. Distill it before publishing anything
+public.
+</SourceCard>
+
+## Knowledge check
+
+<Quiz
+  title="Desktop lifecycle check"
+  questions={[
+    {
+      prompt: "If a sync task closes after an Automerge panic, what should an old client handle do?",
+      choices: [
+        "Report disconnected and require higher-level reconnect/reopen",
+        "Keep accepting commands against stale state",
+        "Reuse the previous peer's sent hashes"
+      ],
+      answer: 0,
+      explanation: "The old peer conversation is over. Reconnect should establish fresh state."
+    },
+    {
+      prompt: "Why is closing only the offending peer insufficient after a daemon-side mutation panic?",
+      choices: [
+        "Because the shared room document may still be suspect",
+        "Because peer ids must be globally monotonic",
+        "Because bloom filters are disabled"
+      ],
+      answer: 0,
+      explanation: "If shared in-memory state may be corrupted, other peers should not keep using it blindly."
+    }
+  ]}
+/>
