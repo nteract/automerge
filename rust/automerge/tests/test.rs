@@ -1806,6 +1806,46 @@ fn into_transaction_with_mismatched_active_patch_log_returns_error() {
 }
 
 #[test]
+fn apply_change_with_missing_sequence_insert_key_returns_error_without_panic() {
+    let mut doc = Automerge::new();
+    let actor = doc.get_actor().clone();
+    let mut tx = doc.transaction();
+    let list = tx.put_object(ROOT, "list", ObjType::List).unwrap();
+    tx.insert(&list, 0, "seed").unwrap();
+    let (heads, _) = tx.commit();
+
+    let change_actor = ActorId::from(b"change" as &[u8]);
+    let change = ExpandedChange {
+        operations: vec![automerge::legacy::Op {
+            action: automerge::legacy::OpType::Put("orphan".into()),
+            obj: automerge::legacy::ObjectId::Id(automerge::legacy::OpId(1, actor.clone())),
+            key: automerge::legacy::Key::Seq(automerge::legacy::ElementId::Id(
+                automerge::legacy::OpId(999, actor),
+            )),
+            pred: automerge::legacy::SortedVec::new(),
+            insert: true,
+        }],
+        actor_id: change_actor,
+        hash: None,
+        seq: 1,
+        start_op: std::num::NonZeroU64::new(1).unwrap(),
+        time: 0,
+        message: None,
+        deps: heads.into_iter().collect(),
+        extra_bytes: Vec::new(),
+    };
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        doc.apply_changes([change.into()])
+    }));
+
+    assert!(
+        matches!(result, Ok(Err(AutomergeError::InvalidSeqKey(_)))),
+        "expected InvalidSeqKey without panic, got {result:?}"
+    );
+}
+
+#[test]
 fn can_isolate() -> Result<(), AutomergeError> {
     let mut doc1 = AutoCommit::new();
     let txt = doc1.put_object(&ROOT, "text", ObjType::Text).unwrap();

@@ -908,6 +908,114 @@ impl BatchApply {
         Ok(())
     }
 
+    fn validate_imported_sequence_keys(
+        &self,
+        doc: &Automerge,
+        imported: &[Vec<ChangeOp>],
+        actors: &[ActorId],
+    ) -> Result<(), AutomergeError> {
+        let mut edges_by_obj: SmallHashMap<ObjId, SmallHashMap<ElemId, Vec<ElemId>>> =
+            HashMap::default();
+        let mut inserts_by_obj: SmallHashMap<ObjId, Vec<(ElemId, ElemId)>> = HashMap::default();
+
+        for ops in imported {
+            for op in ops {
+                if !op.insert() {
+                    continue;
+                }
+                if let KeyRef::Seq(key) = op.key() {
+                    let key = *key;
+                    let id = ElemId(op.id());
+                    edges_by_obj
+                        .entry(op.bld.obj)
+                        .or_default()
+                        .entry(key)
+                        .or_default()
+                        .push(id);
+                    inserts_by_obj
+                        .entry(op.bld.obj)
+                        .or_default()
+                        .push((id, key));
+                }
+            }
+        }
+
+        for (obj, inserts) in inserts_by_obj {
+            let mut reachable = HashSet::new();
+            let mut queue = VecDeque::from([ElemId::head()]);
+
+            if let Some(edges) = edges_by_obj.get(&obj) {
+                for key in edges.keys() {
+                    if key.is_head() {
+                        continue;
+                    }
+                    if let (Some(doc_key), Some(doc_obj)) = (
+                        Self::elem_id_in_current_doc(*key, actors, doc),
+                        Self::obj_id_in_current_doc(obj, actors, doc),
+                    ) {
+                        if let Some((op, _)) =
+                            doc.ops().find_op_by_id_and_vis_slow(&doc_key.0, None)
+                        {
+                            if op.obj == doc_obj && op.insert {
+                                queue.push_back(*key);
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut edges = edges_by_obj.remove(&obj).unwrap_or_default();
+            while let Some(key) = queue.pop_front() {
+                if !reachable.insert(key) {
+                    continue;
+                }
+                if let Some(children) = edges.remove(&key) {
+                    queue.extend(children);
+                }
+            }
+
+            for (id, key) in inserts {
+                if !reachable.contains(&id) {
+                    return Err(AutomergeError::InvalidSeqKey(Self::format_elem_id(
+                        key, actors,
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn elem_id_in_current_doc(elem: ElemId, actors: &[ActorId], doc: &Automerge) -> Option<ElemId> {
+        if elem.is_head() {
+            Some(elem)
+        } else {
+            let actor = actors.get(elem.0.actor())?;
+            let actor_index = doc.ops().lookup_actor(actor)?;
+            Some(ElemId(OpId::new(elem.0.counter(), actor_index)))
+        }
+    }
+
+    fn obj_id_in_current_doc(obj: ObjId, actors: &[ActorId], doc: &Automerge) -> Option<ObjId> {
+        if obj.is_root() {
+            Some(obj)
+        } else {
+            let actor = actors.get(obj.0.actor())?;
+            let actor_index = doc.ops().lookup_actor(actor)?;
+            Some(ObjId(OpId::new(obj.0.counter(), actor_index)))
+        }
+    }
+
+    fn format_elem_id(elem: ElemId, actors: &[ActorId]) -> String {
+        if elem.is_head() {
+            "HEAD".to_string()
+        } else if let Some(actor) = actors.get(elem.0.actor()) {
+            format!("{}@{}", elem.0.counter(), actor)
+        } else {
+            format!("{elem:?}")
+        }
+    }
+
     fn import_ops(&mut self, doc: &mut Automerge, imported: Vec<Vec<ChangeOp>>) {
         for (change, ops) in self.changes.iter().zip(imported) {
             self.ops.extend(ops);
@@ -928,6 +1036,7 @@ impl BatchApply {
         migrated_log.migrate_actors(&actors)?;
         let imported = self.imported_ops(&actors)?;
         self.validate_imported_ops_objects(obj_info, &imported)?;
+        self.validate_imported_sequence_keys(doc, &imported, &actors)?;
 
         self.insert_new_actors(doc);
 
