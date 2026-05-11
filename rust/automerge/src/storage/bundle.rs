@@ -164,8 +164,95 @@ pub struct InvalidBundle(String);
 
 #[cfg(test)]
 mod test {
+    use sha2::{Digest, Sha256};
+
+    use crate::legacy::{Key, ObjectId, Op, OpType, SortedVec};
+    use crate::storage::{columns::ColumnId, columns::ColumnSpec, parse, Chunk};
     use crate::transaction::Transactable;
-    use crate::{Automerge, ROOT};
+    use crate::{Automerge, Change, ROOT};
+    use std::num::NonZeroU64;
+
+    fn rewrite_bundle_checksum(bytes: &mut [u8]) -> Result<(), String> {
+        if bytes.len() < 8 {
+            return Err("bundle should contain a header and checksum".to_string());
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes[8..]);
+        let hash = hasher.finalize();
+        bytes[4..8].copy_from_slice(&hash[..4]);
+        Ok(())
+    }
+
+    fn assert_bundle_error_references(
+        result: Result<Result<usize, crate::AutomergeError>, Box<dyn std::any::Any + Send>>,
+        expected: &str,
+    ) -> Result<(), String> {
+        match result {
+            Ok(Err(crate::AutomergeError::Load(
+                crate::storage::load::Error::InvalidBundleColumn(err),
+            ))) => {
+                let parse_error = err
+                    .downcast_ref::<crate::storage::bundle::ParseError>()
+                    .ok_or_else(|| format!("expected bundle parse error, got {err:?}"))?;
+                match parse_error {
+                    crate::storage::bundle::ParseError::ReadOp(
+                        crate::op_set2::ReadOpError::MissingValue(field),
+                    ) if *field == expected => Ok(()),
+                    _ => Err(format!(
+                        "expected bundle error to reference {expected:?}, got {parse_error:?}"
+                    )),
+                }
+            }
+            Ok(Err(err)) => Err(format!("expected invalid bundle column error, got {err:?}")),
+            Ok(Ok(applied)) => Err(format!(
+                "expected invalid bundle to return Err, applied {applied} ops"
+            )),
+            Err(_) => Err("expected invalid bundle to return Err without panic".to_string()),
+        }
+    }
+
+    fn root_put_change_with_extra(extra: Vec<u8>) -> Result<Change, String> {
+        let op = Op {
+            action: OpType::Put(crate::ScalarValue::Str("value".into())),
+            obj: ObjectId::Root,
+            key: Key::Map("key".into()),
+            pred: SortedVec::new(),
+            insert: false,
+        };
+        let stored = crate::storage::Change::builder()
+            .with_actor(crate::ActorId::from(b"bundle-extra" as &[u8]))
+            .with_seq(1)
+            .with_start_op(
+                NonZeroU64::new(1).ok_or_else(|| "expected non-zero start op".to_string())?,
+            )
+            .with_timestamp(0)
+            .with_extra_bytes(extra)
+            .build([op].iter())
+            .map_err(|err| err.to_string())?;
+        Ok(Change::new(stored))
+    }
+
+    fn one_change_bundle_bytes() -> Result<Vec<u8>, String> {
+        let change = root_put_change_with_extra(vec![1, 2])?;
+        let hash = change.hash();
+        let mut doc = Automerge::new();
+        doc.apply_changes([change]).map_err(|err| err.to_string())?;
+        Ok(doc
+            .bundle([hash])
+            .map_err(|err| err.to_string())?
+            .bytes()
+            .to_vec())
+    }
+
+    fn parsed_bundle(
+        bytes: &[u8],
+    ) -> Result<crate::storage::BundleStorage<'_, crate::storage::change::Unverified>, String> {
+        let (_, chunk) = Chunk::parse(parse::Input::new(bytes)).map_err(|err| err.to_string())?;
+        let Chunk::Bundle(bundle) = chunk else {
+            return Err("expected bundle chunk".to_string());
+        };
+        Ok(bundle)
+    }
 
     #[test]
     fn make_bundle() {
@@ -206,5 +293,59 @@ mod test {
         assert_eq!(changes[0].hash(), h0);
         assert_eq!(changes[1].max_op(), 3);
         assert_eq!(changes[1].hash(), h2);
+    }
+
+    #[test]
+    fn load_bundle_with_invalid_extra_count_returns_error_without_panic() -> Result<(), String> {
+        let mut bytes = one_change_bundle_bytes()?;
+        let extra_count_byte = {
+            let bundle = parsed_bundle(&bytes)?;
+            let extra_count_range = bundle
+                .changes_meta
+                .as_map()
+                .get(&ColumnSpec::new_group(ColumnId::new(6)))
+                .ok_or_else(|| "bundle should have extra count column".to_string())?
+                .clone();
+            bundle.changes_data.start + extra_count_range.end - 1
+        };
+
+        bytes[extra_count_byte] = bytes[extra_count_byte]
+            .checked_add(1)
+            .ok_or_else(|| "extra count byte overflowed".to_string())?;
+        rewrite_bundle_checksum(&mut bytes)?;
+
+        let mut doc = Automerge::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            doc.load_incremental(&bytes)
+        }));
+
+        assert_bundle_error_references(result, "extra")
+    }
+
+    #[test]
+    fn load_bundle_with_invalid_value_meta_returns_error_without_panic() -> Result<(), String> {
+        let mut bytes = one_change_bundle_bytes()?;
+        let value_meta_byte = {
+            let bundle = parsed_bundle(&bytes)?;
+            let value_meta_range = bundle
+                .ops_meta
+                .as_map()
+                .get(&ColumnSpec::new_value_metadata(ColumnId::new(5)))
+                .ok_or_else(|| "bundle should have value metadata column".to_string())?
+                .clone();
+            bundle.ops_data.start + value_meta_range.end - 1
+        };
+
+        bytes[value_meta_byte] = bytes[value_meta_byte]
+            .checked_add(16)
+            .ok_or_else(|| "value metadata byte overflowed".to_string())?;
+        rewrite_bundle_checksum(&mut bytes)?;
+
+        let mut doc = Automerge::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            doc.load_incremental(&bytes)
+        }));
+
+        assert_bundle_error_references(result, "value")
     }
 }
