@@ -1846,6 +1846,138 @@ fn apply_change_with_missing_sequence_insert_key_returns_error_without_panic() {
 }
 
 #[test]
+fn apply_change_with_missing_sequence_update_key_returns_error() -> Result<(), AutomergeError> {
+    let mut doc = Automerge::new();
+    let actor = doc.get_actor().clone();
+    let mut tx = doc.transaction();
+    let list = tx.put_object(ROOT, "list", ObjType::List)?;
+    tx.insert(&list, 0, "seed")?;
+    let (heads, _) = tx.commit();
+
+    let change_actor = ActorId::from(b"change" as &[u8]);
+    let change = ExpandedChange {
+        operations: vec![automerge::legacy::Op {
+            action: automerge::legacy::OpType::Put("orphan".into()),
+            obj: automerge::legacy::ObjectId::Id(automerge::legacy::OpId(1, actor.clone())),
+            key: automerge::legacy::Key::Seq(automerge::legacy::ElementId::Id(
+                automerge::legacy::OpId(999, actor),
+            )),
+            pred: automerge::legacy::SortedVec::new(),
+            insert: false,
+        }],
+        actor_id: change_actor,
+        hash: None,
+        seq: 1,
+        start_op: std::num::NonZeroU64::MIN,
+        time: 0,
+        message: None,
+        deps: heads.into_iter().collect(),
+        extra_bytes: Vec::new(),
+    };
+    let change: Change = change.into();
+    let hash = change.hash();
+
+    let result = doc.apply_changes([change]);
+
+    assert!(
+        matches!(result, Err(AutomergeError::InvalidSeqKey(_))),
+        "expected InvalidSeqKey, got {result:?}"
+    );
+    assert!(!doc.get_heads().contains(&hash));
+    Ok(())
+}
+
+#[test]
+fn apply_change_with_missing_sequence_delete_key_returns_error() -> Result<(), AutomergeError> {
+    let mut doc = Automerge::new();
+    let actor = doc.get_actor().clone();
+    let mut tx = doc.transaction();
+    let list = tx.put_object(ROOT, "list", ObjType::List)?;
+    tx.insert(&list, 0, "seed")?;
+    let (heads, _) = tx.commit();
+
+    let change_actor = ActorId::from(b"change" as &[u8]);
+    let change = ExpandedChange {
+        operations: vec![automerge::legacy::Op {
+            action: automerge::legacy::OpType::Delete,
+            obj: automerge::legacy::ObjectId::Id(automerge::legacy::OpId(1, actor.clone())),
+            key: automerge::legacy::Key::Seq(automerge::legacy::ElementId::Id(
+                automerge::legacy::OpId(999, actor),
+            )),
+            pred: automerge::legacy::SortedVec::new(),
+            insert: false,
+        }],
+        actor_id: change_actor,
+        hash: None,
+        seq: 1,
+        start_op: std::num::NonZeroU64::MIN,
+        time: 0,
+        message: None,
+        deps: heads.into_iter().collect(),
+        extra_bytes: Vec::new(),
+    };
+    let change: Change = change.into();
+    let hash = change.hash();
+
+    let result = doc.apply_changes([change]);
+
+    assert!(
+        matches!(result, Err(AutomergeError::InvalidSeqKey(_))),
+        "expected InvalidSeqKey, got {result:?}"
+    );
+    assert!(!doc.get_heads().contains(&hash));
+    Ok(())
+}
+
+#[test]
+fn apply_change_can_reference_same_batch_sequence_insert() -> Result<(), AutomergeError> {
+    let mut doc = Automerge::new();
+    let actor = doc.get_actor().clone();
+    let mut tx = doc.transaction();
+    let list = tx.put_object(ROOT, "list", ObjType::List)?;
+    let (heads, _) = tx.commit();
+
+    let change_actor = ActorId::from(b"change" as &[u8]);
+    let inserted_id = automerge::legacy::OpId(1, change_actor.clone());
+    let change = ExpandedChange {
+        operations: vec![
+            automerge::legacy::Op {
+                action: automerge::legacy::OpType::Put("new".into()),
+                obj: automerge::legacy::ObjectId::Id(automerge::legacy::OpId(1, actor.clone())),
+                key: automerge::legacy::Key::Seq(automerge::legacy::ElementId::Head),
+                pred: automerge::legacy::SortedVec::new(),
+                insert: true,
+            },
+            automerge::legacy::Op {
+                action: automerge::legacy::OpType::Put("updated".into()),
+                obj: automerge::legacy::ObjectId::Id(automerge::legacy::OpId(1, actor)),
+                key: automerge::legacy::Key::Seq(automerge::legacy::ElementId::Id(
+                    inserted_id.clone(),
+                )),
+                pred: automerge::legacy::SortedVec::from(vec![inserted_id]),
+                insert: false,
+            },
+        ],
+        actor_id: change_actor,
+        hash: None,
+        seq: 1,
+        start_op: std::num::NonZeroU64::MIN,
+        time: 0,
+        message: None,
+        deps: heads.into_iter().collect(),
+        extra_bytes: Vec::new(),
+    };
+
+    doc.apply_changes([change.into()])?;
+
+    let Some((value, _)) = doc.get(&list, 0)? else {
+        panic!("expected list value");
+    };
+    assert_eq!(value.to_str(), Some("updated"));
+    Ok(())
+}
+
+#[test]
 fn can_isolate() -> Result<(), AutomergeError> {
     let mut doc1 = AutoCommit::new();
     let txt = doc1.put_object(&ROOT, "text", ObjType::Text).unwrap();
