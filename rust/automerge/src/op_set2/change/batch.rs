@@ -5,7 +5,7 @@ use crate::op_set2::SuccInsert;
 use crate::types::{
     ActorId, ElemId, ObjId, ObjType, OpId, Prop, ScalarValue, SequenceType, SmallHashMap,
 };
-use crate::{Automerge, Change, ChangeHash, PatchLog, PatchLogMismatch};
+use crate::{Automerge, Change, ChangeHash, PatchLog};
 use crate::{AutomergeError, TextEncoding};
 
 use super::super::op::{ChangeOp, Op, OpBuilder};
@@ -793,10 +793,28 @@ impl BatchApply {
         }
     }
 
-    fn import_ops(&mut self, doc: &mut Automerge) {
-        for c in &self.changes {
-            doc.import_ops_to(c, &mut self.ops).unwrap();
-            doc.update_history(c);
+    fn actors_after_new_changes(&self, doc: &Automerge) -> Vec<ActorId> {
+        let mut actors = doc.ops().actors.clone();
+        for c in self.changes.iter().filter(|c| c.seq() == 1) {
+            if let Err(index) = actors.binary_search(c.actor_id()) {
+                actors.insert(index, c.actor_id().clone());
+            }
+        }
+        actors
+    }
+
+    fn imported_ops(&self, actors: &[ActorId]) -> Result<Vec<Vec<ChangeOp>>, AutomergeError> {
+        let mut imported = Vec::with_capacity(self.changes.len());
+        for change in &self.changes {
+            imported.push(Automerge::import_change_ops(actors, change)?);
+        }
+        Ok(imported)
+    }
+
+    fn import_ops(&mut self, doc: &mut Automerge, imported: Vec<Vec<ChangeOp>>) {
+        for (change, ops) in self.changes.iter().zip(imported) {
+            self.ops.extend(ops);
+            doc.update_history(change);
         }
         doc.remove_unused_actors(true);
     }
@@ -805,12 +823,17 @@ impl BatchApply {
         &mut self,
         doc: &mut Automerge,
         log: &mut PatchLog,
-    ) -> Result<(), PatchLogMismatch> {
+    ) -> Result<(), AutomergeError> {
+        let actors = self.actors_after_new_changes(doc);
+        let mut migrated_log = log.clone();
+        migrated_log.migrate_actors(&actors)?;
+        let imported = self.imported_ops(&actors)?;
+
         self.insert_new_actors(doc);
 
-        log.migrate_actors(&doc.ops().actors)?;
+        *log = migrated_log;
 
-        self.import_ops(doc);
+        self.import_ops(doc, imported);
 
         let mut obj_info = doc.ops().obj_info.clone();
 
@@ -1088,21 +1111,19 @@ impl Automerge {
         Ok(chap.apply(self, log)?)
     }
 
-    fn import_ops_to(
-        &mut self,
+    fn import_change_ops(
+        actors_in_doc: &[ActorId],
         change: &Change,
-        ops: &mut Vec<ChangeOp>,
-    ) -> Result<(), AutomergeError> {
-        let new_ops = self.import_ops(change)?;
-        ops.extend(new_ops);
-        Ok(())
-    }
-
-    fn import_ops(&mut self, change: &Change) -> Result<Vec<ChangeOp>, AutomergeError> {
+    ) -> Result<Vec<ChangeOp>, AutomergeError> {
         let actors: Vec<_> = change
             .actors()
-            .map(|a| self.ops.lookup_actor(a).unwrap())
-            .collect();
+            .map(|a| {
+                actors_in_doc
+                    .binary_search(a)
+                    .ok()
+                    .ok_or_else(|| AutomergeError::InvalidActorId(a.to_string()))
+            })
+            .collect::<Result<_, _>>()?;
 
         change
             .iter_ops()
@@ -1143,11 +1164,14 @@ impl Automerge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroU64;
+
+    use crate::legacy::{Key, ObjectId, OpType, SortedVec};
     use crate::marks::{ExpandMark, Mark};
     use crate::read::ReadDoc;
     use crate::transaction::Transactable;
     use crate::types;
-    use crate::{ActorId, AutoCommit, ROOT};
+    use crate::{ActorId, AutoCommit, Automerge, ROOT};
     use rand::prelude::*;
 
     impl AutoCommit {
@@ -1162,6 +1186,69 @@ mod tests {
             self.validate_top_index();
             Ok(())
         }
+    }
+
+    fn root_put_change(
+        actor: ActorId,
+        key: &str,
+        value: &str,
+        extra_actor: Option<ActorId>,
+    ) -> Change {
+        let op = crate::legacy::Op {
+            action: OpType::Put(crate::ScalarValue::Str(value.into())),
+            obj: ObjectId::Root,
+            key: Key::Map(key.into()),
+            pred: SortedVec::new(),
+            insert: false,
+        };
+        let mut stored = crate::storage::Change::builder()
+            .with_actor(actor)
+            .with_seq(1)
+            .with_start_op(NonZeroU64::new(1).unwrap())
+            .with_timestamp(0)
+            .build([op].iter())
+            .unwrap();
+        if let Some(actor) = extra_actor {
+            stored.other_actors.push(actor);
+        }
+        Change::new(stored)
+    }
+
+    #[test]
+    fn apply_change_with_unknown_actor_in_change_actor_table_returns_error() {
+        let actor1 = ActorId::try_from("aaaaaa").unwrap();
+        let actor2 = ActorId::try_from("bbbbbb").unwrap();
+        let change = root_put_change(actor1, "key", "value", Some(actor2));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Automerge::new().apply_changes([change])
+        }));
+
+        assert!(
+            matches!(result, Ok(Err(AutomergeError::InvalidActorId(_)))),
+            "expected InvalidActorId without panic, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn apply_batch_with_late_unknown_actor_returns_error_without_partial_change() {
+        let actor1 = ActorId::try_from("aaaaaa").unwrap();
+        let actor2 = ActorId::try_from("bbbbbb").unwrap();
+        let actor3 = ActorId::try_from("cccccc").unwrap();
+        let valid = root_put_change(actor1, "valid", "ok", None);
+        let valid_hash = valid.hash();
+        let invalid = root_put_change(actor2, "invalid", "bad", Some(actor3));
+        let mut doc = Automerge::new();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            doc.apply_changes([valid, invalid])
+        }));
+
+        assert!(
+            matches!(result, Ok(Err(AutomergeError::InvalidActorId(_)))),
+            "expected InvalidActorId without panic, got {result:?}"
+        );
+        assert_eq!(doc.get(&ROOT, "valid").unwrap(), None);
+        assert!(!doc.has_change(&valid_hash));
     }
 
     #[test]
