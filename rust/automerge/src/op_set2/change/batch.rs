@@ -855,6 +855,32 @@ impl BatchApply {
         Ok(())
     }
 
+    fn validate_change_op_counters(&self) -> Result<(), AutomergeError> {
+        for change in &self.changes {
+            let max_op = if change.is_empty() {
+                change.start_op().get()
+            } else {
+                change
+                    .start_op()
+                    .get()
+                    .checked_add((change.len() - 1) as u64)
+                    .ok_or_else(|| AutomergeError::InvalidOpCounter {
+                        counter: u64::MAX,
+                        actor: change.actor_id().clone(),
+                    })?
+            };
+
+            if u32::try_from(max_op).is_err() {
+                return Err(AutomergeError::InvalidOpCounter {
+                    counter: max_op,
+                    actor: change.actor_id().clone(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
     fn validate_imported_ops_objects(
         &self,
         mut obj_info: ObjIndex,
@@ -893,6 +919,7 @@ impl BatchApply {
         log: &mut PatchLog,
     ) -> Result<(), AutomergeError> {
         self.validate_change_sequences(doc)?;
+        self.validate_change_op_counters()?;
         let (actors, obj_info) = self.actors_and_obj_index_after_new_changes(doc);
         let mut migrated_log = log.clone();
         migrated_log.migrate_actors(&actors)?;
@@ -1305,6 +1332,33 @@ mod tests {
         Change::new(stored)
     }
 
+    fn root_two_put_change_with_start_op(actor: ActorId, start_op: u64) -> Change {
+        let ops = [
+            crate::legacy::Op {
+                action: OpType::Put(crate::ScalarValue::Str("one".into())),
+                obj: ObjectId::Root,
+                key: Key::Map("one".into()),
+                pred: SortedVec::new(),
+                insert: false,
+            },
+            crate::legacy::Op {
+                action: OpType::Put(crate::ScalarValue::Str("two".into())),
+                obj: ObjectId::Root,
+                key: Key::Map("two".into()),
+                pred: SortedVec::new(),
+                insert: false,
+            },
+        ];
+        let stored = crate::storage::Change::builder()
+            .with_actor(actor)
+            .with_seq(1)
+            .with_start_op(NonZeroU64::new(start_op).unwrap())
+            .with_timestamp(0)
+            .build(ops.iter())
+            .unwrap();
+        Change::new(stored)
+    }
+
     #[test]
     fn apply_change_with_unknown_actor_in_change_actor_table_returns_error() {
         let actor1 = ActorId::try_from("aaaaaa").unwrap();
@@ -1386,6 +1440,43 @@ mod tests {
         assert_eq!(doc.get(&ROOT, "invalid").unwrap(), None);
         assert!(!doc.has_change(&second_hash));
         assert!(!doc.has_change(&invalid_hash));
+    }
+
+    #[test]
+    fn apply_change_with_op_counter_overflow_returns_error_without_panic() {
+        let actor = ActorId::try_from("aaaaaa").unwrap();
+        let change = root_two_put_change_with_start_op(actor.clone(), u32::MAX as u64);
+        let hash = change.hash();
+        let mut doc = Automerge::new();
+
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| doc.apply_changes([change])));
+
+        assert!(
+            matches!(
+                &result,
+                Ok(Err(AutomergeError::InvalidOpCounter { counter, actor: err_actor }))
+                    if *counter == u64::from(u32::MAX) + 1 && err_actor == &actor
+            ),
+            "expected InvalidOpCounter without panic, got {result:?}"
+        );
+        assert_eq!(doc.get(&ROOT, "one").unwrap(), None);
+        assert_eq!(doc.get(&ROOT, "two").unwrap(), None);
+        assert!(!doc.has_change(&hash));
+    }
+
+    #[test]
+    fn parse_change_with_op_counter_overflow_returns_error() {
+        let actor = ActorId::try_from("aaaaaa").unwrap();
+        let change = root_two_put_change_with_start_op(actor, u32::MAX as u64);
+        let result = Change::try_from(change.raw_bytes());
+
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|err| err.to_string().contains("counter too large")),
+            "expected counter-too-large parse error, got {result:?}"
+        );
     }
 
     #[test]

@@ -33,6 +33,8 @@ pub enum AutomergeError {
     InvalidObjId(String),
     #[error("invalid obj id format `{0}`")]
     InvalidObjIdFormat(String),
+    #[error("op counter {counter} is out of bounds for actor {actor}")]
+    InvalidOpCounter { counter: u64, actor: ActorId },
     #[error("invalid op for object of type `{0}`")]
     InvalidOp(ObjType),
     #[error("seq {0} is out of bounds")]

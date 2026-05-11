@@ -179,7 +179,15 @@ impl<'a> Change<'a, Unverified> {
             f(op?);
             num_ops += 1;
         }
-        if u32::try_from(u64::from(self.start_op)).is_err() {
+        let max_counter = if num_ops == 0 {
+            self.start_op.get()
+        } else {
+            self.start_op
+                .get()
+                .checked_add((num_ops - 1) as u64)
+                .ok_or(ReadChangeOpError::CounterTooLarge)?
+        };
+        if u32::try_from(max_counter).is_err() {
             return Err(ReadChangeOpError::CounterTooLarge);
         }
         Ok(Change {
