@@ -896,8 +896,11 @@ impl BatchApply {
 
         for ops in imported {
             for op in ops {
-                if obj_info.object_type(&op.bld.obj).is_none() {
-                    return Err(AutomergeError::InvalidObjId(format!("{:?}", op.bld.obj)));
+                let obj_type = obj_info
+                    .object_type(&op.bld.obj)
+                    .ok_or_else(|| AutomergeError::InvalidObjId(format!("{:?}", op.bld.obj)))?;
+                if op.bld.action == Action::Mark && obj_type != ObjType::Text {
+                    return Err(AutomergeError::InvalidOp(obj_type));
                 }
             }
         }
@@ -1263,7 +1266,7 @@ mod tests {
     use super::*;
     use std::num::NonZeroU64;
 
-    use crate::legacy::{Key, ObjectId, OpType, SortedVec};
+    use crate::legacy::{Key, MarkData as LegacyMarkData, ObjectId, OpType, SortedVec};
     use crate::marks::{ExpandMark, Mark};
     use crate::read::ReadDoc;
     use crate::transaction::Transactable;
@@ -1506,6 +1509,44 @@ mod tests {
         assert!(
             matches!(result, Ok(Err(AutomergeError::InvalidObjId(_)))),
             "expected InvalidObjId without panic, got {result:?}"
+        );
+        assert!(!doc.has_change(&hash));
+    }
+
+    #[test]
+    fn apply_mark_on_map_returns_error_before_hydrate_can_panic() {
+        let actor = ActorId::try_from("aaaaaa").unwrap();
+        let op = crate::legacy::Op {
+            action: OpType::MarkBegin(LegacyMarkData {
+                name: "bold".into(),
+                value: crate::ScalarValue::Boolean(true),
+                expand: false,
+            }),
+            obj: ObjectId::Root,
+            key: Key::Map("bad-mark".into()),
+            pred: SortedVec::new(),
+            insert: false,
+        };
+        let stored = crate::storage::Change::builder()
+            .with_actor(actor)
+            .with_seq(1)
+            .with_start_op(NonZeroU64::new(1).unwrap())
+            .with_timestamp(0)
+            .build([op].iter())
+            .unwrap();
+        let change = Change::new(stored);
+        let hash = change.hash();
+        let mut doc = Automerge::new();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            doc.apply_changes([change])?;
+            let _ = doc.hydrate(None);
+            Ok::<_, AutomergeError>(())
+        }));
+
+        assert!(
+            matches!(result, Ok(Err(AutomergeError::InvalidOp(ObjType::Map)))),
+            "expected InvalidOp(Map) before hydrate without panic, got {result:?}"
         );
         assert!(!doc.has_change(&hash));
     }
