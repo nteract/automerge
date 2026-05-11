@@ -433,16 +433,15 @@ impl AutoCommit {
         self.isolation = None;
     }
 
-    pub(crate) fn ensure_transaction_open(&mut self) {
+    pub(crate) fn ensure_transaction_open(&mut self) -> Result<(), AutomergeError> {
         if self.transaction.is_none() {
             let args = self.doc.transaction_args(self.isolation.as_deref());
-            self.patch_log
-                .migrate_actors(&self.doc.ops().actors)
-                .unwrap();
+            self.patch_log.migrate_actors(&self.doc.ops().actors)?;
             let inner = TransactionInner::new(args);
             let branch = self.patch_log.branch();
             self.transaction = Some((branch, inner));
         }
+        Ok(())
     }
 
     pub(crate) fn ensure_transaction_closed(&mut self) {
@@ -662,14 +661,23 @@ impl AutoCommit {
 
     /// Commit any uncommitted changes
     ///
-    /// Returns [`None`] if there were no operations to commit
+    /// Returns [`None`] if there were no operations to commit. Use [`Self::try_commit`] if you
+    /// need to distinguish "no operations" from transaction setup errors.
     pub fn commit(&mut self) -> Option<ChangeHash> {
         self.commit_with(CommitOptions::default())
     }
 
+    /// Commit any uncommitted changes, returning errors from transaction setup.
+    ///
+    /// Returns [`None`] if there were no operations to commit.
+    pub fn try_commit(&mut self) -> Result<Option<ChangeHash>, AutomergeError> {
+        self.try_commit_with(CommitOptions::default())
+    }
+
     /// Commit the current operations with some options.
     ///
-    /// Returns [`None`] if there were no operations to commit
+    /// Returns [`None`] if there were no operations to commit. Use [`Self::try_commit_with`] if you
+    /// need to distinguish "no operations" from transaction setup errors.
     ///
     /// ```
     /// # use automerge::transaction::CommitOptions;
@@ -685,15 +693,27 @@ impl AutoCommit {
     /// doc.commit_with(CommitOptions::default().with_message("Create todos list").with_time(now));
     /// ```
     pub fn commit_with(&mut self, options: CommitOptions) -> Option<ChangeHash> {
+        self.try_commit_with(options).ok().flatten()
+    }
+
+    /// Commit the current operations with some options, returning errors from transaction setup.
+    ///
+    /// Returns [`None`] if there were no operations to commit.
+    pub fn try_commit_with(
+        &mut self,
+        options: CommitOptions,
+    ) -> Result<Option<ChangeHash>, AutomergeError> {
         // ensure that even no changes triggers a change
-        self.ensure_transaction_open();
-        let (patch_log, tx) = self.transaction.take().unwrap();
+        self.ensure_transaction_open()?;
+        // `ensure_transaction_open` either leaves an existing transaction in place or creates one.
+        // If that invariant changes, return an explicit error from this fallible API.
+        let (patch_log, tx) = self.transaction.take().ok_or(AutomergeError::Fail)?;
         self.patch_log.merge(patch_log);
         let hash = tx.commit(&mut self.doc, options.message, options.time);
         if self.isolation.is_some() && hash.is_some() {
             self.isolation = hash.map(|h| vec![h])
         }
-        hash
+        Ok(hash)
     }
 
     /// Remove any changes that have been made in the current transaction from the document
@@ -1018,7 +1038,7 @@ impl Transactable for AutoCommit {
         prop: P,
         value: V,
     ) -> Result<(), AutomergeError> {
-        self.ensure_transaction_open();
+        self.ensure_transaction_open()?;
         let (patch_log, tx) = self.transaction.as_mut().unwrap();
         tx.put(&mut self.doc, patch_log, obj.as_ref(), prop, value)
     }
@@ -1029,7 +1049,7 @@ impl Transactable for AutoCommit {
         prop: P,
         value: ObjType,
     ) -> Result<ExId, AutomergeError> {
-        self.ensure_transaction_open();
+        self.ensure_transaction_open()?;
         let (patch_log, tx) = self.transaction.as_mut().unwrap();
         tx.put_object(&mut self.doc, patch_log, obj.as_ref(), prop, value)
     }
@@ -1040,7 +1060,7 @@ impl Transactable for AutoCommit {
         index: usize,
         value: V,
     ) -> Result<(), AutomergeError> {
-        self.ensure_transaction_open();
+        self.ensure_transaction_open()?;
         let (patch_log, tx) = self.transaction.as_mut().unwrap();
         tx.insert(&mut self.doc, patch_log, obj.as_ref(), index, value)
     }
@@ -1051,7 +1071,7 @@ impl Transactable for AutoCommit {
         index: usize,
         value: ObjType,
     ) -> Result<ExId, AutomergeError> {
-        self.ensure_transaction_open();
+        self.ensure_transaction_open()?;
         let (patch_log, tx) = self.transaction.as_mut().unwrap();
         tx.insert_object(&mut self.doc, patch_log, obj.as_ref(), index, value)
     }
@@ -1062,7 +1082,7 @@ impl Transactable for AutoCommit {
         prop: P,
         value: i64,
     ) -> Result<(), AutomergeError> {
-        self.ensure_transaction_open();
+        self.ensure_transaction_open()?;
         let (patch_log, tx) = self.transaction.as_mut().unwrap();
         tx.increment(&mut self.doc, patch_log, obj.as_ref(), prop, value)
     }
@@ -1072,7 +1092,7 @@ impl Transactable for AutoCommit {
         obj: O,
         prop: P,
     ) -> Result<(), AutomergeError> {
-        self.ensure_transaction_open();
+        self.ensure_transaction_open()?;
         let (patch_log, tx) = self.transaction.as_mut().unwrap();
         tx.delete(&mut self.doc, patch_log, obj.as_ref(), prop)
     }
@@ -1085,7 +1105,7 @@ impl Transactable for AutoCommit {
         del: isize,
         vals: I,
     ) -> Result<(), AutomergeError> {
-        self.ensure_transaction_open();
+        self.ensure_transaction_open()?;
         let (patch_log, tx) = self.transaction.as_mut().unwrap();
         tx.splice(&mut self.doc, patch_log, obj.as_ref(), pos, del, vals)
     }
@@ -1097,7 +1117,7 @@ impl Transactable for AutoCommit {
         del: isize,
         text: &str,
     ) -> Result<(), AutomergeError> {
-        self.ensure_transaction_open();
+        self.ensure_transaction_open()?;
         let (patch_log, tx) = self.transaction.as_mut().unwrap();
         tx.splice_text(&mut self.doc, patch_log, obj.as_ref(), pos, del, text)?;
         Ok(())
@@ -1109,7 +1129,7 @@ impl Transactable for AutoCommit {
         mark: Mark,
         expand: ExpandMark,
     ) -> Result<(), AutomergeError> {
-        self.ensure_transaction_open();
+        self.ensure_transaction_open()?;
         let (patch_log, tx) = self.transaction.as_mut().unwrap();
         tx.mark(&mut self.doc, patch_log, obj.as_ref(), mark, expand)
     }
@@ -1122,7 +1142,7 @@ impl Transactable for AutoCommit {
         end: usize,
         expand: ExpandMark,
     ) -> Result<(), AutomergeError> {
-        self.ensure_transaction_open();
+        self.ensure_transaction_open()?;
         let (patch_log, tx) = self.transaction.as_mut().unwrap();
         tx.unmark(
             &mut self.doc,
@@ -1139,13 +1159,13 @@ impl Transactable for AutoCommit {
     where
         O: AsRef<ExId>,
     {
-        self.ensure_transaction_open();
+        self.ensure_transaction_open()?;
         let (patch_log, tx) = self.transaction.as_mut().unwrap();
         tx.split_block(&mut self.doc, patch_log, obj.as_ref(), index)
     }
 
     fn join_block<O: AsRef<ExId>>(&mut self, text: O, index: usize) -> Result<(), AutomergeError> {
-        self.ensure_transaction_open();
+        self.ensure_transaction_open()?;
         let (patch_log, tx) = self.transaction.as_mut().unwrap();
         tx.join_block(&mut self.doc, patch_log, text.as_ref(), index)
     }
@@ -1154,7 +1174,7 @@ impl Transactable for AutoCommit {
     where
         O: AsRef<ExId>,
     {
-        self.ensure_transaction_open();
+        self.ensure_transaction_open()?;
         let (patch_log, tx) = self.transaction.as_mut().unwrap();
         tx.replace_block(&mut self.doc, patch_log, text.as_ref(), index)
     }
@@ -1172,7 +1192,7 @@ impl Transactable for AutoCommit {
         obj: &ExId,
         new_text: S,
     ) -> Result<(), AutomergeError> {
-        self.ensure_transaction_open();
+        self.ensure_transaction_open()?;
         let (patch_log, tx) = self.transaction.as_mut().unwrap();
         crate::text_diff::myers_diff(&mut self.doc, tx, patch_log, obj, new_text)
     }
@@ -1183,7 +1203,7 @@ impl Transactable for AutoCommit {
         config: UpdateSpansConfig,
         new_text: I,
     ) -> Result<(), AutomergeError> {
-        self.ensure_transaction_open();
+        self.ensure_transaction_open()?;
         let (patch_log, tx) = self.transaction.as_mut().unwrap();
         crate::text_diff::myers_block_diff(
             &mut self.doc,
@@ -1200,7 +1220,7 @@ impl Transactable for AutoCommit {
         obj: O,
         new_value: &crate::hydrate::Value,
     ) -> Result<(), crate::error::UpdateObjectError> {
-        self.ensure_transaction_open();
+        self.ensure_transaction_open()?;
         let (patch_log, tx) = self.transaction.as_mut().unwrap();
         tx.update_object(&mut self.doc, patch_log, obj.as_ref(), new_value)
     }
@@ -1212,7 +1232,7 @@ impl Transactable for AutoCommit {
         value: &crate::hydrate::Value,
         insert: bool,
     ) -> Result<ExId, AutomergeError> {
-        self.ensure_transaction_open();
+        self.ensure_transaction_open()?;
         let (patch_log, tx) = self.transaction.as_mut().unwrap();
         tx.batch_create_object(
             &mut self.doc,
@@ -1228,7 +1248,7 @@ impl Transactable for AutoCommit {
         &mut self,
         value: &crate::hydrate::Map,
     ) -> Result<(), AutomergeError> {
-        self.ensure_transaction_open();
+        self.ensure_transaction_open()?;
         let (patch_log, tx) = self.transaction.as_mut().unwrap();
         tx.batch_init_root_map(&mut self.doc, patch_log, value)?;
         Ok(())
@@ -1313,8 +1333,10 @@ impl OpRange {
 #[cfg(test)]
 mod tests {
     use crate::{
-        patches::PatchLog, sync::SyncDoc, transaction::Transactable, ActorId, AutoCommit,
-        AutomergeError, ReadDoc, ScalarValue, Value, ROOT,
+        patches::PatchLog,
+        sync::SyncDoc,
+        transaction::{CommitOptions, Transactable},
+        ActorId, AutoCommit, AutomergeError, ReadDoc, ScalarValue, Value, ROOT,
     };
 
     fn is_send<S: Send>() {}
@@ -1397,6 +1419,85 @@ mod tests {
         assert!(
             matches!(result, Ok(Err(AutomergeError::PatchLogMismatch))),
             "expected PatchLogMismatch without panic, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn local_transaction_with_active_mismatched_patch_log_returns_error() {
+        let mut doc = AutoCommit::new();
+        doc.set_actor(ActorId::from(b"local" as &[u8]));
+        doc.put(ROOT, "local", "value").unwrap();
+        doc.commit();
+
+        doc.patch_log = PatchLog::active();
+        doc.patch_log.actors = vec![ActorId::from(b"aaa-stale-actor" as &[u8])];
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            doc.put(ROOT, "next", "value")
+        }));
+
+        assert!(
+            matches!(result, Ok(Err(AutomergeError::PatchLogMismatch))),
+            "expected PatchLogMismatch without panic, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn try_commit_with_active_mismatched_patch_log_returns_error() {
+        let mut doc = AutoCommit::new();
+        doc.set_actor(ActorId::from(b"local" as &[u8]));
+        doc.put(ROOT, "local", "value").unwrap();
+        doc.commit();
+
+        doc.patch_log = PatchLog::active();
+        doc.patch_log.actors = vec![ActorId::from(b"aaa-stale-actor" as &[u8])];
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| doc.try_commit()));
+
+        assert!(
+            matches!(result, Ok(Err(AutomergeError::PatchLogMismatch))),
+            "expected PatchLogMismatch without panic, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn try_commit_with_preserves_commit_options() {
+        let mut doc = AutoCommit::new();
+        doc.set_actor(ActorId::from(b"local" as &[u8]));
+        doc.put(ROOT, "local", "value").unwrap();
+
+        let hash = doc
+            .try_commit_with(
+                CommitOptions::default()
+                    .with_message("try commit")
+                    .with_time(123),
+            )
+            .unwrap()
+            .expect("pending operation should produce a change");
+        let change = doc
+            .get_last_local_change()
+            .expect("committed change should be recorded");
+
+        assert_eq!(change.hash(), hash);
+        assert_eq!(change.message().map(String::as_str), Some("try commit"));
+        assert_eq!(change.timestamp(), 123);
+    }
+
+    #[test]
+    fn legacy_commit_with_active_mismatched_patch_log_returns_none_without_panic() {
+        let mut doc = AutoCommit::new();
+        doc.set_actor(ActorId::from(b"local" as &[u8]));
+        doc.put(ROOT, "local", "value").unwrap();
+        doc.commit();
+
+        doc.patch_log = PatchLog::active();
+        doc.patch_log.actors = vec![ActorId::from(b"aaa-stale-actor" as &[u8])];
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| doc.commit()));
+
+        assert!(
+            matches!(result, Ok(None)),
+            "expected legacy commit to avoid panicking and return None, got {result:?}"
         );
     }
 }
