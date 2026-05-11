@@ -386,6 +386,8 @@ pub(crate) enum ReconstructError {
     InvalidActorId(usize),
     #[error("invalid column length {0:?}")]
     InvalidColumnLength(ColumnSpec),
+    #[error("invalid change dependency index {0}")]
+    InvalidChangeDepIndex(usize),
     #[error("max_op is lower than start_op")]
     InvalidMaxOp,
     #[error(transparent)]
@@ -409,3 +411,61 @@ impl std::fmt::Debug for MismatchedHeads {
 }
 
 use super::load::VerificationMode;
+
+#[cfg(test)]
+mod tests {
+    use sha2::{Digest, Sha256};
+
+    use super::*;
+    use crate::{
+        storage::{columns::ColumnId, parse, Chunk},
+        transaction::Transactable,
+        AutoCommit, Automerge, ROOT,
+    };
+
+    fn rewrite_document_checksum(bytes: &mut [u8]) {
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes[8..]);
+        let hash = hasher.finalize();
+        bytes[4..8].copy_from_slice(&hash[..4]);
+    }
+
+    #[test]
+    fn load_document_with_invalid_change_dep_index_returns_error_without_panic(
+    ) -> Result<(), String> {
+        let mut doc = AutoCommit::new();
+        doc.put(ROOT, "a", 1).map_err(|err| err.to_string())?;
+        doc.commit();
+        doc.put(ROOT, "b", 2).map_err(|err| err.to_string())?;
+        doc.commit();
+
+        let mut bytes = doc.save_nocompress();
+        let dep_byte = {
+            let (_, chunk) =
+                Chunk::parse(parse::Input::new(&bytes)).map_err(|err| err.to_string())?;
+            let Chunk::Document(parsed) = chunk else {
+                return Err("expected document chunk".to_string());
+            };
+
+            let deps_val_spec = ColumnSpec::new_delta(ColumnId::new(4));
+            let deps_val_range = parsed
+                .change_meta()
+                .as_map()
+                .get(&deps_val_spec)
+                .ok_or_else(|| "document should have change deps values".to_string())?
+                .clone();
+            assert_eq!(deps_val_range.len(), 2);
+            parsed.change_bytes.start + deps_val_range.end - 1
+        };
+
+        bytes[dep_byte] = 4;
+        rewrite_document_checksum(&mut bytes);
+
+        let result = std::panic::catch_unwind(|| Automerge::load(&bytes));
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "expected load error without panic, got {result:?}"
+        );
+        Ok(())
+    }
+}
