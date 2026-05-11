@@ -243,18 +243,47 @@ impl TransactionInner {
             .map(|opid| doc.id_to_exid(opid.unwrap()))
     }
 
-    pub(super) fn next_id(&self) -> OpId {
-        OpId::new(self.start_op.get() + self.pending_ops() as u64, self.actor)
+    pub(super) fn next_id(&self, doc: &Automerge) -> Result<OpId, AutomergeError> {
+        let actor = doc
+            .ops()
+            .actors
+            .get(self.actor)
+            .ok_or(AutomergeError::InvalidActorIndex(self.actor))?;
+        let counter = self
+            .start_op
+            .get()
+            .checked_add(self.pending_ops() as u64)
+            .ok_or_else(|| AutomergeError::InvalidOpCounter {
+                counter: u64::MAX,
+                actor: actor.clone(),
+            })?;
+        if u32::try_from(counter).is_err() {
+            return Err(AutomergeError::InvalidOpCounter {
+                counter,
+                actor: actor.clone(),
+            });
+        }
+        if u32::try_from(self.actor).is_err() {
+            return Err(AutomergeError::InvalidActorIndex(self.actor));
+        }
+        Ok(OpId::new(counter, self.actor))
     }
 
-    fn next_delete(&mut self, obj: ObjMeta, index: usize, elemid: ElemId, ops: &[Op<'_>]) -> TxOp {
-        TxOp::list_del(
-            self.next_id(),
+    fn next_delete(
+        &mut self,
+        doc: &Automerge,
+        obj: ObjMeta,
+        index: usize,
+        elemid: ElemId,
+        ops: &[Op<'_>],
+    ) -> Result<TxOp, AutomergeError> {
+        Ok(TxOp::list_del(
+            self.next_id(doc)?,
             obj,
             index,
             elemid,
             ops.iter().map(|op| op.id),
-        )
+        ))
     }
 
     fn insert_local_op(
@@ -321,7 +350,7 @@ impl TransactionInner {
         index: usize,
         action: OpType,
     ) -> Result<OpId, AutomergeError> {
-        let id = self.next_id();
+        let id = self.next_id(doc)?;
 
         let query = doc
             .ops()
@@ -363,7 +392,7 @@ impl TransactionInner {
         prop: String,
         action: OpType,
     ) -> Result<Option<OpId>, AutomergeError> {
-        let id = self.next_id();
+        let id = self.next_id(doc)?;
 
         let mut query = doc
             .ops()
@@ -409,7 +438,7 @@ impl TransactionInner {
         let mut query = doc
             .ops()
             .seek_ops_by_index(&obj.id, index, seq_type, self.scope.as_ref());
-        let id = self.next_id();
+        let id = self.next_id(doc)?;
         let eid = query
             .ops
             .first()
@@ -580,7 +609,7 @@ impl TransactionInner {
                 SpliceType::Text(t) => {
                     let mut batch = BatchInsertion::new(self, doc, patch_log, query.pos);
                     let SpliceResult { inserted_width } =
-                        batch.splice_text(obj, query.index, query.elemid, t, query.marks);
+                        batch.splice_text(obj, query.index, query.elemid, t, query.marks)?;
                     batch.finish();
                     inserted_width
                 }
@@ -598,7 +627,7 @@ impl TransactionInner {
 
                             let id = batch.append(move |pos, id| {
                                 TxOp::insert(id, obj, pos, query.index + i, op_type, elemid)
-                            });
+                            })?;
                             elemid = ElemId(id);
 
                             if let Some(obj_type) = child_obj_type {
@@ -654,7 +683,7 @@ impl TransactionInner {
             }
 
             let query_elemid = query.elemid().ok_or(AutomergeError::InvalidIndex(index))?;
-            let op = self.next_delete(obj, delete_index, query_elemid, &query.ops);
+            let op = self.next_delete(doc, obj, delete_index, query_elemid, &query.ops)?;
             let ops_pos = query
                 .ops
                 .iter()
@@ -750,7 +779,7 @@ impl TransactionInner {
 
         let pos = query.pos;
 
-        let id = self.next_id();
+        let id = self.next_id(doc)?;
 
         let op = TxOp::insert_obj(id, obj, pos, index, ObjType::Map, query.elemid);
 
@@ -809,7 +838,7 @@ impl TransactionInner {
             )
             .unwrap();
 
-        let op = TxOp::list_del(self.next_id(), text_obj, index, elemid, [found.op.id]);
+        let op = TxOp::list_del(self.next_id(doc)?, text_obj, index, elemid, [found.op.id]);
 
         let succ_pos = vec![found.op.add_succ(op.id(), None)];
 
@@ -1161,7 +1190,7 @@ impl TransactionInner {
                     key.to_string(),
                     vec![],
                 )
-            });
+            })?;
 
             if let Some(obj_type) = child_obj_type {
                 let child_obj_meta = ObjMeta {
@@ -1244,13 +1273,16 @@ impl<'a> BatchInsertion<'a> {
         self.inner.pending[self.pending_start..].len() + self.insert_pos
     }
 
-    fn append<F: FnOnce(usize, OpId) -> TxOp>(&mut self, factory: F) -> OpId {
-        let id = self.inner.next_id();
+    fn append<F: FnOnce(usize, OpId) -> TxOp>(
+        &mut self,
+        factory: F,
+    ) -> Result<OpId, AutomergeError> {
+        let id = self.inner.next_id(self.doc)?;
         let op = factory(self.next_pos(), id);
         self.inner
             .finalize_op(self.doc.text_encoding(), self.patch_log, &op, None);
         self.inner.pending.push(op);
-        id
+        Ok(id)
     }
 
     fn splice_text(
@@ -1260,7 +1292,7 @@ impl<'a> BatchInsertion<'a> {
         after: ElemId,
         text_str: &str,
         marks: Option<Arc<MarkSet>>,
-    ) -> SpliceResult {
+    ) -> Result<SpliceResult, AutomergeError> {
         let char_values: Vec<ScalarValue> = match self.doc.text_encoding() {
             // Arguably we should do this for all text, rather than just the grapheme cluster encoding.
             // However, at the time which I (Alex Good) am writing this code the existing implementation
@@ -1276,7 +1308,7 @@ impl<'a> BatchInsertion<'a> {
         let mut elemid = after;
         for char in char_values {
             let op = TxOp::insert_val(
-                self.inner.next_id(),
+                self.inner.next_id(self.doc)?,
                 container,
                 self.next_pos(),
                 char,
@@ -1291,7 +1323,7 @@ impl<'a> BatchInsertion<'a> {
             self.patch_log.splice(container.id, index, text_str, marks);
         }
 
-        SpliceResult { inserted_width }
+        Ok(SpliceResult { inserted_width })
     }
 
     fn finish(self) {
@@ -1342,7 +1374,7 @@ fn batch_bfs(
                             key.to_string(),
                             vec![],
                         )
-                    });
+                    })?;
 
                     if let Some(obj_type) = child_obj_type {
                         let child_obj_meta = ObjMeta {
@@ -1361,7 +1393,7 @@ fn batch_bfs(
 
                     let id = batch.append(move |pos, id| {
                         TxOp::insert(id, container_meta, pos, index, op_type, elemid)
-                    });
+                    })?;
                     elemid = ElemId(id);
 
                     if let Some(obj_type) = child_obj_type {
@@ -1375,7 +1407,7 @@ fn batch_bfs(
             }
             (ObjType::Text, hydrate::Value::Text(text)) => {
                 let text_str = text.to_string();
-                batch.splice_text(container_meta, 0, ElemId::head(), &text_str, None);
+                batch.splice_text(container_meta, 0, ElemId::head(), &text_str, None)?;
             }
             _ => {
                 return Err(AutomergeError::InvalidOp(container_meta.typ));

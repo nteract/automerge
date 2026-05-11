@@ -1333,13 +1333,33 @@ impl OpRange {
 #[cfg(test)]
 mod tests {
     use crate::{
+        legacy::{Key, ObjectId, OpType, SortedVec},
         patches::PatchLog,
         sync::SyncDoc,
         transaction::{CommitOptions, Transactable},
-        ActorId, AutoCommit, AutomergeError, ReadDoc, ScalarValue, Value, ROOT,
+        ActorId, AutoCommit, AutomergeError, Change, ReadDoc, ScalarValue, Value, ROOT,
     };
+    use std::num::NonZeroU64;
 
     fn is_send<S: Send>() {}
+
+    fn root_put_change_with_start_op(actor: ActorId, start_op: u64) -> Change {
+        let op = crate::legacy::Op {
+            action: OpType::Put(crate::ScalarValue::Str("value".into())),
+            obj: ObjectId::Root,
+            key: Key::Map("remote".into()),
+            pred: SortedVec::new(),
+            insert: false,
+        };
+        let stored = crate::storage::Change::builder()
+            .with_actor(actor)
+            .with_seq(1)
+            .with_start_op(NonZeroU64::new(start_op).unwrap())
+            .with_timestamp(0)
+            .build([op].iter())
+            .unwrap();
+        Change::new(stored)
+    }
 
     #[test]
     fn test_autocommit_is_send() {
@@ -1440,6 +1460,30 @@ mod tests {
             matches!(result, Ok(Err(AutomergeError::PatchLogMismatch))),
             "expected PatchLogMismatch without panic, got {result:?}"
         );
+    }
+
+    #[test]
+    fn local_transaction_after_max_op_returns_error_without_panic() {
+        let local_actor = ActorId::from(b"local" as &[u8]);
+        let remote =
+            root_put_change_with_start_op(ActorId::from(b"remote" as &[u8]), u32::MAX as u64);
+        let mut doc = AutoCommit::new();
+        doc.set_actor(local_actor.clone());
+        doc.apply_changes([remote]).unwrap();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            doc.put(ROOT, "local", "value")
+        }));
+
+        assert!(
+            matches!(
+                &result,
+                Ok(Err(AutomergeError::InvalidOpCounter { counter, actor }))
+                    if *counter == u64::from(u32::MAX) + 1 && actor == &local_actor
+            ),
+            "expected InvalidOpCounter without panic, got {result:?}"
+        );
+        assert_eq!(doc.get(ROOT, "local").unwrap(), None);
     }
 
     #[test]
