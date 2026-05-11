@@ -836,6 +836,9 @@ impl ChangeGraphCols {
             for e in 0..d {
                 let dep = deps_val.next();
                 let dep = dep.ok_or(LoadError::InvalidColumnLength(DEPS_VAL_COL_SPEC))??;
+                if dep as usize >= len {
+                    return Err(LoadError::InvalidChangeDepIndex(dep as usize));
+                }
                 let target = NodeIdx(dep);
                 let next = EdgeIdx::new(edges.len() + 1);
                 let next = if e + 1 == d { None } else { Some(next) };
