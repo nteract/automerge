@@ -825,6 +825,36 @@ impl BatchApply {
         Ok(imported)
     }
 
+    fn validate_change_sequences(&self, doc: &Automerge) -> Result<(), AutomergeError> {
+        let mut next_seq_by_actor = HashMap::new();
+
+        for change in &self.changes {
+            let expected = if let Some(next_seq) = next_seq_by_actor.get(change.actor_id()) {
+                *next_seq
+            } else {
+                doc.ops()
+                    .lookup_actor(change.actor_id())
+                    .map(|actor| doc.change_graph.seq_for_actor(actor) + 1)
+                    .unwrap_or(1)
+            };
+
+            match change.seq().cmp(&expected) {
+                Ordering::Equal => {
+                    next_seq_by_actor.insert(change.actor_id().clone(), expected + 1);
+                }
+                Ordering::Less => {
+                    return Err(AutomergeError::DuplicateSeqNumber(
+                        change.seq(),
+                        change.actor_id().clone(),
+                    ));
+                }
+                Ordering::Greater => return Err(AutomergeError::InvalidSeq(change.seq())),
+            }
+        }
+
+        Ok(())
+    }
+
     fn validate_imported_ops_objects(
         &self,
         mut obj_info: ObjIndex,
@@ -862,6 +892,7 @@ impl BatchApply {
         doc: &mut Automerge,
         log: &mut PatchLog,
     ) -> Result<(), AutomergeError> {
+        self.validate_change_sequences(doc)?;
         let (actors, obj_info) = self.actors_and_obj_index_after_new_changes(doc);
         let mut migrated_log = log.clone();
         migrated_log.migrate_actors(&actors)?;
@@ -1233,6 +1264,27 @@ mod tests {
         value: &str,
         extra_actor: Option<ActorId>,
     ) -> Change {
+        root_put_change_with_seq(actor, 1, key, value, extra_actor)
+    }
+
+    fn root_put_change_with_seq(
+        actor: ActorId,
+        seq: u64,
+        key: &str,
+        value: &str,
+        extra_actor: Option<ActorId>,
+    ) -> Change {
+        root_put_change_with_seq_and_start_op(actor, seq, 1, key, value, extra_actor)
+    }
+
+    fn root_put_change_with_seq_and_start_op(
+        actor: ActorId,
+        seq: u64,
+        start_op: u64,
+        key: &str,
+        value: &str,
+        extra_actor: Option<ActorId>,
+    ) -> Change {
         let op = crate::legacy::Op {
             action: OpType::Put(crate::ScalarValue::Str(value.into())),
             obj: ObjectId::Root,
@@ -1242,8 +1294,8 @@ mod tests {
         };
         let mut stored = crate::storage::Change::builder()
             .with_actor(actor)
-            .with_seq(1)
-            .with_start_op(NonZeroU64::new(1).unwrap())
+            .with_seq(seq)
+            .with_start_op(NonZeroU64::new(start_op).unwrap())
             .with_timestamp(0)
             .build([op].iter())
             .unwrap();
@@ -1288,6 +1340,52 @@ mod tests {
         );
         assert_eq!(doc.get(&ROOT, "valid").unwrap(), None);
         assert!(!doc.has_change(&valid_hash));
+    }
+
+    #[test]
+    fn apply_change_with_sequence_gap_returns_error_without_partial_change() {
+        let actor = ActorId::try_from("aaaaaa").unwrap();
+        let valid = root_put_change(actor.clone(), "valid", "ok", None);
+        let change = root_put_change_with_seq_and_start_op(actor, 3, 2, "invalid", "bad", None);
+        let hash = change.hash();
+        let mut doc = Automerge::new();
+        doc.apply_changes([valid]).unwrap();
+
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| doc.apply_changes([change])));
+
+        assert!(
+            matches!(result, Ok(Err(AutomergeError::InvalidSeq(3)))),
+            "expected InvalidSeq without panic, got {result:?}"
+        );
+        assert_eq!(doc.get(&ROOT, "invalid").unwrap(), None);
+        assert!(!doc.has_change(&hash));
+    }
+
+    #[test]
+    fn apply_batch_with_late_sequence_gap_returns_error_without_partial_change() {
+        let actor = ActorId::try_from("aaaaaa").unwrap();
+        let first = root_put_change(actor.clone(), "first", "ok", None);
+        let second =
+            root_put_change_with_seq_and_start_op(actor.clone(), 2, 2, "second", "ok", None);
+        let second_hash = second.hash();
+        let invalid = root_put_change_with_seq_and_start_op(actor, 4, 3, "invalid", "bad", None);
+        let invalid_hash = invalid.hash();
+        let mut doc = Automerge::new();
+        doc.apply_changes([first]).unwrap();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            doc.apply_changes([second, invalid])
+        }));
+
+        assert!(
+            matches!(result, Ok(Err(AutomergeError::InvalidSeq(4)))),
+            "expected InvalidSeq without panic, got {result:?}"
+        );
+        assert_eq!(doc.get(&ROOT, "second").unwrap(), None);
+        assert_eq!(doc.get(&ROOT, "invalid").unwrap(), None);
+        assert!(!doc.has_change(&second_hash));
+        assert!(!doc.has_change(&invalid_hash));
     }
 
     #[test]
