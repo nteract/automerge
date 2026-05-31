@@ -1335,7 +1335,7 @@ impl Automerge {
             self.queue.push(c);
         }
 
-        Ok(chap.apply(self, log)?)
+        chap.apply(self, log)
     }
 
     fn import_change_ops(
