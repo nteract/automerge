@@ -71,10 +71,12 @@ use itertools::Itertools;
 use serde::ser::SerializeMap;
 use std::collections::{HashMap, HashSet};
 
+#[cfg(test)]
+use crate::ReadDoc;
 use crate::{
     patches::PatchLog,
     storage::{parse, ReadChangeOpError},
-    Automerge, AutomergeError, ChangeHash, ReadDoc,
+    Automerge, AutomergeError, ChangeHash,
 };
 
 mod bloom;
@@ -168,7 +170,9 @@ impl SyncDoc for Automerge {
         let our_need = if sync_state.read_only {
             vec![]
         } else {
-            self.get_missing_deps(sync_state.their_heads.as_ref().unwrap_or(&vec![]))
+            // Only request what we need to reach this peer's advertised heads. The queue may
+            // contain orphans received from another peer which this peer cannot satisfy.
+            self.missing_deps_from(sync_state.their_heads.iter().flatten().copied())
         };
 
         let their_heads_set = if let Some(ref heads) = sync_state.their_heads {
@@ -978,6 +982,73 @@ mod tests {
             .expect("known requested hash should still be sent");
 
         assert_eq!(message.changes.len(), 1);
+    }
+
+    #[test]
+    fn queued_orphan_does_not_block_sync_with_an_unrelated_peer() {
+        let mut left = crate::AutoCommit::new().with_actor(ActorId::from(vec![0]));
+        left.put(crate::ROOT, "base", 0_u64).unwrap();
+        left.commit();
+        let base = left.save();
+
+        let mut orphan_source = left.fork().with_actor(ActorId::from(vec![1]));
+        orphan_source.put(crate::ROOT, "missing", 1_u64).unwrap();
+        orphan_source.commit();
+        let missing = orphan_source.get_heads()[0];
+
+        orphan_source.put(crate::ROOT, "orphan", 2_u64).unwrap();
+        orphan_source.commit();
+        let orphan_head = orphan_source.get_heads()[0];
+        let orphan_changes = orphan_source.get_changes(&[missing]);
+        assert_eq!(orphan_changes.len(), 1);
+
+        // Simulate an interrupted sync which delivered a change without its
+        // dependency. The change is valid, but cannot leave the queue yet.
+        let orphan_message = Message {
+            heads: vec![orphan_head],
+            need: vec![],
+            have: vec![],
+            changes: orphan_changes
+                .into_iter()
+                .map(|change| change.raw_bytes().to_vec())
+                .collect::<Vec<_>>()
+                .into(),
+            flags: None,
+            version: MessageVersion::V1,
+        };
+        left.sync()
+            .receive_sync_message(&mut State::new(), orphan_message)
+            .unwrap();
+        assert_eq!(left.get_missing_deps(&[]), vec![missing]);
+
+        // A different peer does not have the orphan's missing dependency, but
+        // it does have a valid unrelated change. The stale orphan must not
+        // prevent these two replicas from synchronizing what they can share.
+        let mut right = crate::AutoCommit::load(&base)
+            .unwrap()
+            .with_actor(ActorId::from(vec![2]));
+        right.put(crate::ROOT, "right", 3_u64).unwrap();
+        right.commit();
+
+        let right_heads = right.get_heads();
+        let mut left_to_right = State::new();
+        left_to_right.their_heads = Some(right_heads.clone());
+        let request = left
+            .sync()
+            .generate_sync_message(&mut left_to_right)
+            .expect("left should request the unrelated peer's advertised head");
+
+        assert_eq!(request.need, right_heads);
+        assert!(
+            !request.have.is_empty(),
+            "the queued orphan must not suppress the summary used to request unrelated changes"
+        );
+
+        sync(&mut left, &mut right, &mut State::new(), &mut State::new());
+
+        assert_eq!(left.get_heads(), right.get_heads());
+        assert!(left.get(crate::ROOT, "right").unwrap().is_some());
+        assert_eq!(left.get_missing_deps(&[]), vec![missing]);
     }
 
     #[test]
