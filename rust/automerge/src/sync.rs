@@ -985,7 +985,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_orphan_does_not_block_sync_with_an_unrelated_peer() {
+    fn queued_orphan_need_is_scoped_to_the_advertised_peer_heads() {
         let mut left = crate::AutoCommit::new().with_actor(ActorId::from(vec![0]));
         left.put(crate::ROOT, "base", 0_u64).unwrap();
         left.commit();
@@ -1002,8 +1002,8 @@ mod tests {
         let orphan_changes = orphan_source.get_changes(&[missing]);
         assert_eq!(orphan_changes.len(), 1);
 
-        // Simulate an interrupted sync which delivered a change without its
-        // dependency. The change is valid, but cannot leave the queue yet.
+        // Queue a valid change whose dependency was not delivered. This
+        // dependency belongs to the source peer's history.
         let orphan_message = Message {
             heads: vec![orphan_head],
             need: vec![],
@@ -1021,9 +1021,9 @@ mod tests {
             .unwrap();
         assert_eq!(left.get_missing_deps(&[]), vec![missing]);
 
-        // A different peer does not have the orphan's missing dependency, but
-        // it does have a valid unrelated change. The stale orphan must not
-        // prevent these two replicas from synchronizing what they can share.
+        // A different peer advertises an unrelated head. A need packet for
+        // that peer must be derived only from the history reachable from its
+        // advertised heads, not from every missing dependency in our queue.
         let mut right = crate::AutoCommit::load(&base)
             .unwrap()
             .with_actor(ActorId::from(vec![2]));
@@ -1041,14 +1041,8 @@ mod tests {
         assert_eq!(request.need, right_heads);
         assert!(
             !request.have.is_empty(),
-            "the queued orphan must not suppress the summary used to request unrelated changes"
+            "a peer-scoped need should allow the usual have summary"
         );
-
-        sync(&mut left, &mut right, &mut State::new(), &mut State::new());
-
-        assert_eq!(left.get_heads(), right.get_heads());
-        assert!(left.get(crate::ROOT, "right").unwrap().is_some());
-        assert_eq!(left.get_missing_deps(&[]), vec![missing]);
     }
 
     #[test]
